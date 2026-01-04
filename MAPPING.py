@@ -20,10 +20,11 @@ yaw = 0
 points = []
 
 dr.init()
-#drone = tello.Tello()
-#drone.connect()
-global img 
-#print (drone.get_battery())
+drone = tello.Tello()
+drone.connect()
+global img
+print (drone.get_battery())
+drone.streamon()
 
 def getKeyboardInput():
     lr,fb,ud,yv = 0,0,0,0
@@ -65,7 +66,7 @@ def getKeyboardInput():
     #elif dr.getKey("e"): drone.takeoff()
 
     if dr.getKey("c"): 
-        cv2.imwrite(f'Resources/Image/{time.time()}.jpg',img)
+        cv2.imwrite(f'Resources/Image/{time.time()}.jpg',im)
 
     time.sleep(interval)
     a += yaw
@@ -84,9 +85,12 @@ def drawPoints(img, points):
 
 while True:
     val = getKeyboardInput()
-    #drone.send_rc_control(val[0],val[1],val[2],val[3])
+    drone.send_rc_control(val[0],val[1],val[2],val[3])
+    im = drone.get_frame_read().frame
+    im = cv2.resize(img,(360, 240))
     img = np.zeros((1000,1000,3), np.uint8)
     points.append((val[4],val[5]))
     drawPoints(img,points)
     cv2.imshow("OUTPUT",img)
     cv2.waitKey(1)
+
