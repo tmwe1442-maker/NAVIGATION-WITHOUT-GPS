@@ -33,21 +33,31 @@ def load_resources():
     cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
     predictor = DefaultPredictor(cfg)
 
-    # B. Load REFERENCE MAPS (Từ Folder)
-    ref_folder = "reference_maps"  # Tên folder chứa các bản đồ
-    os.makedirs(ref_folder, exist_ok=True)
+    # =========================================================================
+    # B. Load REFERENCE MAPS (CHỈNH SỬA TẠI ĐÂY)
+    # =========================================================================
+    
+    # ⚠️ HƯỚNG DẪN: Thay đường dẫn bên dưới bằng đường dẫn folder thật của bạn.
+    # Lưu ý: Thêm chữ r ở trước để tránh lỗi đường dẫn Windows (ví dụ: r"C:\Users\Maps")
+    ref_folder = r"C:\Users\Admin\Documents\My_Drone_Maps" 
     
     # Init Feature Matcher
     orb = cv2.ORB_create(nfeatures=2000)
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     
-    # Danh sách chứa dữ liệu các bản đồ: [{'name': 'map1.jpg', 'img': img, 'kp': kp, 'des': des}, ...]
     ref_maps_data = []
     
+    # Kiểm tra xem folder có tồn tại không
+    if not os.path.exists(ref_folder):
+        st.error(f"❌ LỖI: Không tìm thấy thư mục bản đồ tại: {ref_folder}")
+        # Trả về danh sách rỗng để code không bị crash
+        return predictor, cfg, [], matcher, orb
+
+    # Lấy danh sách file trong folder đó
     map_files = [f for f in os.listdir(ref_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     
     if not map_files:
-        st.warning(f"⚠️ Thư mục '{ref_folder}' trống! Vui lòng thêm ảnh bản đồ vào.")
+        st.warning(f"⚠️ Thư mục '{ref_folder}' tồn tại nhưng không có ảnh nào!")
     else:
         for f in map_files:
             path = os.path.join(ref_folder, f)
@@ -70,6 +80,7 @@ def load_resources():
 predictor, cfg, ref_maps_data, matcher, orb_detector = load_resources()
 
 # --- CẤU HÌNH THƯ MỤC INPUT/OUTPUT ---
+# (Phần này giữ nguyên hoặc sửa tương tự nếu muốn folder Input cũng cố định)
 input_path = "./input_images/"
 output_path = "./processed_images/"
 os.makedirs(input_path, exist_ok=True)
@@ -95,7 +106,7 @@ if 'last_pos' not in st.session_state:
     st.session_state['last_pos'] = [0, 0]
 
 # --- VÒNG LẶP XỬ LÝ ---
-st.info(f"Hệ thống đang chạy... Đã load {len(ref_maps_data)} bản đồ tham chiếu.")
+st.info(f"Hệ thống đang chạy... Đã load {len(ref_maps_data)} bản đồ tham chiếu từ: {ref_maps_data[0]['name'] if ref_maps_data else 'Empty'}")
 
 while True:
     files = [f for f in os.listdir(input_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
@@ -150,7 +161,7 @@ while True:
             savemat('alpha_m.mat', {'alpha_m': []})
             placeholder_mask.warning("Không tìm thấy hạt nào.")
 
-        # --- BƯỚC 3: MATCHING VỚI FOLDER MAPS (Đã cập nhật) ---
+        # --- BƯỚC 3: MATCHING VỚI FOLDER MAPS ---
         if ref_maps_data and orb_detector is not None:
             try:
                 # 3.1 Chuyển ảnh Drone sang xám
@@ -164,20 +175,16 @@ while True:
                     
                     # 3.2 Lặp qua TẤT CẢ các bản đồ đã load
                     for ref_map in ref_maps_data:
-                        # Match với bản đồ hiện tại
                         matches = matcher.match(des_drone, ref_map['des'])
                         
-                        # Lọc các điểm tốt (Good Matches) dựa trên khoảng cách (Distance)
-                        # ORB distance càng nhỏ càng tốt. Ta đếm số lượng match có distance < 60 (ngưỡng tùy chỉnh)
+                        # Lọc Good Matches
                         good_matches = [m for m in matches if m.distance < 60]
                         score = len(good_matches)
                         
-                        # Kiểm tra xem đây có phải là bản đồ khớp nhất không
                         if score > best_match_score:
                             best_match_score = score
                             best_map_name = ref_map['name']
                             
-                            # Vẽ lại matches để hiển thị (Lấy top 20 điểm tốt nhất của map này)
                             sorted_matches = sorted(matches, key=lambda x: x.distance)
                             best_viz_img = cv2.drawMatches(
                                 img_drone_gray, kp_drone,
@@ -187,7 +194,7 @@ while True:
                             )
 
                     # 3.3 Hiển thị kết quả tốt nhất
-                    if best_viz_img is not None and best_match_score > 5: # Ngưỡng tối thiểu để coi là tìm thấy
+                    if best_viz_img is not None and best_match_score > 5:
                         placeholder_match.image(best_viz_img, caption=f"✅ Matched: {best_map_name} (Score: {best_match_score})", use_column_width=True)
                     else:
                         placeholder_match.warning(f"Không tìm thấy bản đồ khớp (Best Score: {best_match_score})")
@@ -199,7 +206,7 @@ while True:
         # --- BƯỚC 4: Clean up ---
         shutil.move(full_path, os.path.join(output_path, file_name))
         
-        # Đọc kết quả từ MATLAB
+        # Đọc kết quả từ MATLAB (Giả lập)
         drone_pos_str = "N/A"
         result_mat = 'drone_pos_result.mat'
         if os.path.exists(result_mat):
