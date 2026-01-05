@@ -132,3 +132,90 @@ while True:
                 mask_uint8 = masks[i].astype(np.uint8)
                 M = cv2.moments(mask_uint8)
                 if M["m00"] != 0:
+                    cX = int(M["m10"] / M["m00"])
+                    cY = int(M["m01"] / M["m00"])
+                    u_m_list.extend([cX, cY])
+                    alpha_m_list.append(scores[i])
+
+            try:
+                savemat('u_m.mat', {'u_m': np.array([u_m_list], dtype=float)})
+                savemat('alpha_m.mat', {'alpha_m': np.array([alpha_m_list], dtype=float)})
+            except Exception as e:
+                log_text.error(f"Lỗi ghi file .mat: {e}")
+
+            img_seg = np.any(masks, axis=0).astype(np.uint8) * 255
+            placeholder_mask.image(img_seg, caption=f"Hạt tìm thấy: {num_instances}", use_column_width=True)
+        else:
+            savemat('u_m.mat', {'u_m': []})
+            savemat('alpha_m.mat', {'alpha_m': []})
+            placeholder_mask.warning("Không tìm thấy hạt nào.")
+
+        # --- BƯỚC 3: MATCHING VỚI FOLDER MAPS (Đã cập nhật) ---
+        if ref_maps_data and orb_detector is not None:
+            try:
+                # 3.1 Chuyển ảnh Drone sang xám
+                img_drone_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+                kp_drone, des_drone = orb_detector.detectAndCompute(img_drone_gray, None)
+                
+                if des_drone is not None and len(des_drone) > 0:
+                    best_match_score = 0
+                    best_map_name = "None"
+                    best_viz_img = None
+                    
+                    # 3.2 Lặp qua TẤT CẢ các bản đồ đã load
+                    for ref_map in ref_maps_data:
+                        # Match với bản đồ hiện tại
+                        matches = matcher.match(des_drone, ref_map['des'])
+                        
+                        # Lọc các điểm tốt (Good Matches) dựa trên khoảng cách (Distance)
+                        # ORB distance càng nhỏ càng tốt. Ta đếm số lượng match có distance < 60 (ngưỡng tùy chỉnh)
+                        good_matches = [m for m in matches if m.distance < 60]
+                        score = len(good_matches)
+                        
+                        # Kiểm tra xem đây có phải là bản đồ khớp nhất không
+                        if score > best_match_score:
+                            best_match_score = score
+                            best_map_name = ref_map['name']
+                            
+                            # Vẽ lại matches để hiển thị (Lấy top 20 điểm tốt nhất của map này)
+                            sorted_matches = sorted(matches, key=lambda x: x.distance)
+                            best_viz_img = cv2.drawMatches(
+                                img_drone_gray, kp_drone,
+                                ref_map['img'], ref_map['kp'],
+                                sorted_matches[:20], None,
+                                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+                            )
+
+                    # 3.3 Hiển thị kết quả tốt nhất
+                    if best_viz_img is not None and best_match_score > 5: # Ngưỡng tối thiểu để coi là tìm thấy
+                        placeholder_match.image(best_viz_img, caption=f"✅ Matched: {best_map_name} (Score: {best_match_score})", use_column_width=True)
+                    else:
+                        placeholder_match.warning(f"Không tìm thấy bản đồ khớp (Best Score: {best_match_score})")
+                else:
+                    placeholder_match.warning("Ảnh Drone quá mờ hoặc không có đặc trưng.")
+            except Exception as e:
+                log_text.error(f"Lỗi Matching: {e}")
+
+        # --- BƯỚC 4: Clean up ---
+        shutil.move(full_path, os.path.join(output_path, file_name))
+        
+        # Đọc kết quả từ MATLAB
+        drone_pos_str = "N/A"
+        result_mat = 'drone_pos_result.mat'
+        if os.path.exists(result_mat):
+            try:
+                for _ in range(3):
+                    try:
+                        mat_data = loadmat(result_mat)
+                        break
+                    except: time.sleep(0.1)
+                
+                if mat_data and 'current_drone_pos' in mat_data:
+                    pos = mat_data['current_drone_pos'][0]
+                    st.session_state['last_pos'] = pos
+                    drone_pos_str = f"X: {pos[0]:.2f} | Y: {pos[1]:.2f}"
+            except: pass
+
+        log_text.success(f"✅ {file_name} -> {drone_pos_str}")
+        
+    time.sleep(1)
