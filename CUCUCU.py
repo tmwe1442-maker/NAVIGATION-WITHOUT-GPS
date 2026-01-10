@@ -1,228 +1,127 @@
-import os
+from djitellopy import tello
 import time
-import shutil
-import cv2
-import numpy as np
-import streamlit as st
-from detectron2 import model_zoo
-from detectron2.engine import DefaultPredictor
-from detectron2.config import get_cfg
-from detectron2.utils.visualizer import Visualizer
-from detectron2.data import MetadataCatalog
-from scipy.io import savemat, loadmat
+import KEYMODULE as dr
+import cv2 
+import numpy as np 
+import math
 
-# --- CẤU HÌNH GIAO DIỆN ---
-st.set_page_config(page_title="Drone Monitoring System", layout="wide")
-st.title("🛰️ Hệ thống Giám sát & Matching Hạt từ Drone")
+############## PARAMETERS #############
+fspeed = 117 / 10 # Forward speed
+aspeed = 360 / 10 # Angular speed
+interval = 0.25 
 
-# --- 1. CẤU HÌNH & LOAD MODEL + LOAD NHIỀU BẢN ĐỒ ---
-@st.cache_resource
-def load_resources():
-    # A. Load AI Model (Detectron2)
-    cfg = get_cfg()
-    cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
-    cfg.MODEL.DEVICE = "cpu"
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.5
-    base_path = os.path.dirname(__file__)
+dinterval = fspeed * interval
+ainterval = aspeed * interval 
+#######################################
+
+x, y = 500, 500 
+a = 0
+yaw = 0
+points = []
+global img 
+
+# DRONE CONNECTION
+drone = tello.Tello()
+drone.connect()
+print(f"BATTERY: {drone.get_battery()}%")
+drone.streamon()
+
+# DRONE CONTROL WINDOW
+dr.init() 
+
+def getKeyboardInput():
+    lr, fb, ud, yv = 0, 0, 0, 0
+    speed = 50 
+    global yaw, x, y, a
+    d = 0
+    move_angle = 0 
+    moving = False
+
+    # LEFT / RIGHT
+    if dr.getKey("LEFT"): 
+        lr = -speed
+        d = dinterval 
+        move_angle = 180 
+        moving = True
+    elif dr.getKey("RIGHT"): 
+        lr = speed
+        d = dinterval 
+        move_angle = 0 
+        moving = True
+        
+    # FORWARD / BACKWARD 
+    if dr.getKey("UP"): 
+        fb = speed
+        d = dinterval 
+        move_angle = 270
+        moving = True
+    elif dr.getKey("DOWN"): 
+        fb = -speed
+        d = -dinterval 
+        move_angle = 90 
+        moving = True
+
+    # ROTATE 
+    if dr.getKey("d"): 
+        yv = speed
+        yaw += ainterval
+    elif dr.getKey("a"): 
+        yv = -speed
+        yaw -= ainterval
+
+    # UP / DOWN 
+    if dr.getKey("w"): ud = speed
+    elif dr.getKey("s"): ud = -speed
+
+    # LAND / TAKEOFF
+    if dr.getKey("q"): drone.land(); time.sleep(2)
+    elif dr.getKey("e"): drone.takeoff()
     
-    if os.path.exists(os.path.join(base_path, "model_final.pth")):
-        cfg.MODEL.WEIGHTS = os.path.join(base_path, "model_final.pth")
-    else:
-        cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+    # CAPTURE IMAGE FOR NAVIGATION
+    if dr.getKey("c"): 
+        cv2.imwrite(f'Resources/Image/{time.time()}.jpg', img_cam)
+
+
+    time.sleep(interval) # REAL TIME DELAY 
     
-    cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1
-    predictor = DefaultPredictor(cfg)
+    # OXY COORDINATES 
+    if moving:
+        angle_rad = math.radians(yaw + move_angle)        
+        x += int(d * math.cos(angle_rad))
+        y += int(d * math.sin(angle_rad))
+    return [lr, fb, ud, yv, x, y]
 
-    # =========================================================================
-    # B. Load REFERENCE MAPS (CHỈNH SỬA TẠI ĐÂY)
-    # =========================================================================
+# MAPPING 
+def drawPoints(img, points):
+
+    # DRONE TRAJECTORY 
+    for point in points:
+        cv2.circle(img, point, 2, (0, 0, 255), cv2.FILLED) 
     
-    # ⚠️ HƯỚNG DẪN: Thay đường dẫn bên dưới bằng đường dẫn folder thật của bạn.
-    # Lưu ý: Thêm chữ r ở trước để tránh lỗi đường dẫn Windows (ví dụ: r"C:\Users\Maps")
-    ref_folder = r"C:\Users\Admin\Documents\My_Drone_Maps" 
-    
-    # Init Feature Matcher
-    orb = cv2.ORB_create(nfeatures=2000)
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    
-    ref_maps_data = []
-    
-    # Kiểm tra xem folder có tồn tại không
-    if not os.path.exists(ref_folder):
-        st.error(f"❌ LỖI: Không tìm thấy thư mục bản đồ tại: {ref_folder}")
-        # Trả về danh sách rỗng để code không bị crash
-        return predictor, cfg, [], matcher, orb
-
-    # Lấy danh sách file trong folder đó
-    map_files = [f for f in os.listdir(ref_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    
-    if not map_files:
-        st.warning(f"⚠️ Thư mục '{ref_folder}' tồn tại nhưng không có ảnh nào!")
-    else:
-        for f in map_files:
-            path = os.path.join(ref_folder, f)
-            # Load ảnh xám
-            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-            if img is not None:
-                kp, des = orb.detectAndCompute(img, None)
-                if des is not None:
-                    ref_maps_data.append({
-                        'name': f,
-                        'img': img,
-                        'kp': kp,
-                        'des': des
-                    })
-                    print(f"Loaded Map: {f} - Keypoints: {len(kp)}")
-    
-    return predictor, cfg, ref_maps_data, matcher, orb
-
-# Load Resources
-predictor, cfg, ref_maps_data, matcher, orb_detector = load_resources()
-
-# --- CẤU HÌNH THƯ MỤC INPUT/OUTPUT ---
-# (Phần này giữ nguyên hoặc sửa tương tự nếu muốn folder Input cũng cố định)
-input_path = "./input_images/"
-output_path = "./processed_images/"
-os.makedirs(input_path, exist_ok=True)
-os.makedirs(output_path, exist_ok=True)
-
-# --- GIAO DIỆN 3 CỘT ---
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.subheader("1. Ảnh Drone & AI Mask")
-    placeholder_img = st.empty()
-with col2:
-    st.subheader("2. Mask Nhị phân (Hạt)")
-    placeholder_mask = st.empty()
-with col3:
-    st.subheader("3. Best Matching Map")
-    placeholder_match = st.empty()
-
-log_area = st.sidebar.header("📜 Nhật ký hệ thống")
-log_text = st.sidebar.empty()
-
-# --- BIẾN TRẠNG THÁI ---
-if 'last_pos' not in st.session_state:
-    st.session_state['last_pos'] = [0, 0]
-
-# --- VÒNG LẶP XỬ LÝ ---
-st.info(f"Hệ thống đang chạy... Đã load {len(ref_maps_data)} bản đồ tham chiếu từ: {ref_maps_data[0]['name'] if ref_maps_data else 'Empty'}")
+    # DRONE POSITION AT TIME t 
+    cv2.circle(img, points[-1], 5, (0, 255, 0), cv2.FILLED)
+    cv2.putText(img, f'({(points[-1][0]-500)/100:.2f}, {-(points[-1][1]-500)/100:.2f})m',
+                (points[-1][0]+10, points[-1][1]+30), cv2.FONT_HERSHEY_PLAIN, 1,
+                (255, 0, 255), 1)
 
 while True:
-    files = [f for f in os.listdir(input_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-    
-    if not files:
-        log_text.markdown(f"*Đang chờ ảnh... (Maps loaded: {len(ref_maps_data)})*")
-        time.sleep(1)
-        continue
+    vals = getKeyboardInput()
+    drone.send_rc_control(vals[0], vals[1], vals[2], vals[3])
+    # VIDEO 
+    try:
+        frame_read = drone.get_frame_read()
+        myFrame = frame_read.frame
+        if myFrame is not None:
+            img_cam = cv2.resize(myFrame, (360, 240))
+            cv2.imshow("TELLO'S CAMERA", img_cam)
+    except Exception as e:
+        print("CAMERA ERROR:", e)
+    img_map = np.zeros((1000, 1000, 3), np.uint8)
+    if len(points) == 0 or points[-1] != (vals[4], vals[5]):
+        points.append((vals[4], vals[5]))
+    drawPoints(img_map, points)
 
-    for file_name in files:
-        full_path = os.path.join(input_path, file_name)
-        log_text.write(f"🔄 Đang xử lý: **{file_name}**")
-        
-        im = cv2.imread(full_path)
-        if im is None: continue
-        
-        # --- BƯỚC 1: Segment Hạt (Detectron2) ---
-        outputs = predictor(im)
-        v = Visualizer(im[:, :, ::-1], MetadataCatalog.get(cfg.DATASETS.TRAIN[0]), scale=0.8)
-        out = v.draw_instance_predictions(outputs["instances"].to("cpu"))
-        placeholder_img.image(out.get_image()[:, :, ::-1], caption=f"Input: {file_name}", use_column_width=True)
-
-        # --- BƯỚC 2: Xử lý dữ liệu MATLAB ---
-        instances = outputs["instances"].to("cpu")
-        num_instances = len(instances)
-        
-        if num_instances > 0:
-            masks = instances.pred_masks.numpy() 
-            scores = instances.scores.numpy()
-            u_m_list = []
-            alpha_m_list = []
-
-            for i in range(num_instances):
-                mask_uint8 = masks[i].astype(np.uint8)
-                M = cv2.moments(mask_uint8)
-                if M["m00"] != 0:
-                    cX = int(M["m10"] / M["m00"])
-                    cY = int(M["m01"] / M["m00"])
-                    u_m_list.extend([cX, cY])
-                    alpha_m_list.append(scores[i])
-
-            try:
-                savemat('u_m.mat', {'u_m': np.array([u_m_list], dtype=float)})
-                savemat('alpha_m.mat', {'alpha_m': np.array([alpha_m_list], dtype=float)})
-            except Exception as e:
-                log_text.error(f"Lỗi ghi file .mat: {e}")
-
-            img_seg = np.any(masks, axis=0).astype(np.uint8) * 255
-            placeholder_mask.image(img_seg, caption=f"Hạt tìm thấy: {num_instances}", use_column_width=True)
-        else:
-            savemat('u_m.mat', {'u_m': []})
-            savemat('alpha_m.mat', {'alpha_m': []})
-            placeholder_mask.warning("Không tìm thấy hạt nào.")
-
-        # --- BƯỚC 3: MATCHING VỚI FOLDER MAPS ---
-        if ref_maps_data and orb_detector is not None:
-            try:
-                # 3.1 Chuyển ảnh Drone sang xám
-                img_drone_gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-                kp_drone, des_drone = orb_detector.detectAndCompute(img_drone_gray, None)
-                
-                if des_drone is not None and len(des_drone) > 0:
-                    best_match_score = 0
-                    best_map_name = "None"
-                    best_viz_img = None
-                    
-                    # 3.2 Lặp qua TẤT CẢ các bản đồ đã load
-                    for ref_map in ref_maps_data:
-                        matches = matcher.match(des_drone, ref_map['des'])
-                        
-                        # Lọc Good Matches
-                        good_matches = [m for m in matches if m.distance < 60]
-                        score = len(good_matches)
-                        
-                        if score > best_match_score:
-                            best_match_score = score
-                            best_map_name = ref_map['name']
-                            
-                            sorted_matches = sorted(matches, key=lambda x: x.distance)
-                            best_viz_img = cv2.drawMatches(
-                                img_drone_gray, kp_drone,
-                                ref_map['img'], ref_map['kp'],
-                                sorted_matches[:20], None,
-                                flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
-                            )
-
-                    # 3.3 Hiển thị kết quả tốt nhất
-                    if best_viz_img is not None and best_match_score > 5:
-                        placeholder_match.image(best_viz_img, caption=f"✅ Matched: {best_map_name} (Score: {best_match_score})", use_column_width=True)
-                    else:
-                        placeholder_match.warning(f"Không tìm thấy bản đồ khớp (Best Score: {best_match_score})")
-                else:
-                    placeholder_match.warning("Ảnh Drone quá mờ hoặc không có đặc trưng.")
-            except Exception as e:
-                log_text.error(f"Lỗi Matching: {e}")
-
-        # --- BƯỚC 4: Clean up ---
-        shutil.move(full_path, os.path.join(output_path, file_name))
-        
-        # Đọc kết quả từ MATLAB (Giả lập)
-        drone_pos_str = "N/A"
-        result_mat = 'drone_pos_result.mat'
-        if os.path.exists(result_mat):
-            try:
-                for _ in range(3):
-                    try:
-                        mat_data = loadmat(result_mat)
-                        break
-                    except: time.sleep(0.1)
-                
-                if mat_data and 'current_drone_pos' in mat_data:
-                    pos = mat_data['current_drone_pos'][0]
-                    st.session_state['last_pos'] = pos
-                    drone_pos_str = f"X: {pos[0]:.2f} | Y: {pos[1]:.2f}"
-            except: pass
-
-        log_text.success(f"✅ {file_name} -> {drone_pos_str}")
-        
-    time.sleep(1)
+    cv2.imshow("TRAJECTORY MAP", img_map)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        drone.land()
+        break
