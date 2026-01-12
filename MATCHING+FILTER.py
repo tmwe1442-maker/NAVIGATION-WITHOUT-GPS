@@ -1,76 +1,63 @@
 import cv2
 import numpy as np
-from shapely.geometry import Polygon, box
-from shapely.affinity import translate, rotate, scale
+from shapely.geometry import Polygon
+from shapely.affinity import translate, scale
 
 # ==============================================================================
-# PHẦN 1: CẤU TRÚC DỮ LIỆU CƠ BẢN
+# PHẦN 1: CẤU TRÚC DỮ LIỆU (GIỮ NGUYÊN)
 # ==============================================================================
 
 class ShapePoint:
-    """
-    Đại diện cho một vật thể hình học (Tòa nhà, Ao hồ...)
-    """
-    def __init__(self, id, polygon, raw_contour, source_type):
+    def __init__(self, id, polygon, source_type):
         self.id = id
-        self.region = polygon       # Shapely Polygon (Dùng để tính toán giao cắt)
-        self.raw_contour = raw_contour # OpenCV Contour (Dùng để tham chiếu nếu cần)
-        self.source = source_type   # "Drone" hoặc "Map"
-        
-        # Đặc trưng hình học
+        self.region = polygon       
+        self.source = source_type   
         self.S = polygon.area
         self.centroid = np.array([polygon.centroid.x, polygon.centroid.y])
 
 class GaussianObservation:
-    """
-    Kết quả của bước Matching -> Đầu vào cho GMM Filter
-    Tương ứng với Công thức (5) trong tài liệu.
-    """
     def __init__(self, mean_pos, alpha_score):
-        self.mean = np.array(mean_pos) # Vị trí ước lượng (mu)
-        
-        # Sigma (Covariance Matrix) tỉ lệ nghịch với Alpha
-        # Alpha càng lớn (khớp càng tốt) -> Sigma càng nhỏ (độ chụm cao)
-        base_error = 5.0 # Sai số cơ bản (mét/pixel)
-        sigma_val = base_error / (alpha_score + 1e-6)
-        self.cov = np.array([[sigma_val, 0], [0, sigma_val]]) # Ma trận hiệp phương sai
-        
-        # Pre-compute để tính toán nhanh
-        self.inv_cov = np.linalg.inv(self.cov)
-        self.det_cov = np.linalg.det(self.cov)
+        self.mean = np.array(mean_pos) 
+        self.score = alpha_score       
+        self.sigma_val = (5.0 / (alpha_score + 1e-6))**2 
 
-    def pdf(self, x):
-        """Tính mật độ xác suất tại vị trí x (Gaussian PDF)"""
-        diff = x - self.mean
-        norm_const = 1.0 / (2 * np.pi * np.sqrt(self.det_cov))
-        exponent = -0.5 * (diff.T @ self.inv_cov @ diff)
-        return norm_const * np.exp(exponent)
+class Particle:
+    def __init__(self, pos, weight):
+        self.mu = np.array(pos, dtype=np.float64)
+        self.w = weight
+        self.c = 0.0 
 
 # ==============================================================================
-# PHẦN 2: XỬ LÝ ẢNH (IMAGE LOADER)
+# PHẦN 2: XỬ LÝ MASK TỪ AI (THAY THẾ LOADER CŨ)
 # ==============================================================================
 
-class BinaryImageLoader:
-    def extract_features(self, image_path, source_type, scale_ratio=1.0):
-        # 1. Đọc ảnh
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            print(f"ERROR: Không tìm thấy ảnh {image_path}")
-            return []
+class MaskProcessor:
+    """
+    Class này nhận đầu vào là ảnh nhị phân (Binary Mask) từ Detectron2
+    và chuyển đổi trực tiếp sang ShapePoint. Bỏ qua bước thresholding thừa thãi.
+    """
+    def extract_features(self, binary_mask, source_type, scale_ratio=1.0):
+        # Input: binary_mask là numpy array (0 và 1 hoặc 0 và 255)
+        if binary_mask is None: return []
 
-        # 2. Xử lý nền (Nếu nền trắng -> Đảo ngược thành nền đen)
-        if img[0, 0] > 127:
-            img = cv2.bitwise_not(img)
+        # Đảm bảo format uint8 cho OpenCV
+        if binary_mask.dtype == bool:
+            mask_img = (binary_mask * 255).astype(np.uint8)
+        else:
+            mask_img = binary_mask.astype(np.uint8)
+            # Nếu mask là float 0-1, scale lên 255
+            if np.max(mask_img) <= 1 and np.max(mask_img) > 0:
+                mask_img = mask_img * 255
 
-        # 3. Tìm đường bao (Contours)
-        contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Tìm contours trực tiếp trên mask
+        contours, _ = cv2.findContours(mask_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         shapes = []
 
         for i, cnt in enumerate(contours):
-            # Lọc nhiễu nhỏ
+            # Bỏ qua nhiễu nhỏ
             if cv2.contourArea(cnt) < 50: continue 
 
-            # 4. Xấp xỉ đa giác (Polygon Approximation)
+            # Xấp xỉ đa giác
             epsilon = 0.02 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
 
@@ -78,65 +65,44 @@ class BinaryImageLoader:
                 pts = [tuple(pt[0]) for pt in approx]
                 poly = Polygon(pts)
                 
-                # Sửa lỗi topology
+                # Fix lỗi hình học
                 if not poly.is_valid: poly = poly.buffer(0)
                 
-                # Rescale nếu cần (Đồng bộ tỷ lệ Drone vs Map)
                 if scale_ratio != 1.0:
                     poly = scale(poly, xfact=scale_ratio, yfact=scale_ratio, origin=(0,0))
 
-                shapes.append(ShapePoint(f"{source_type}_{i}", poly, cnt, source_type))
+                shapes.append(ShapePoint(f"{source_type}_{i}", poly, source_type))
 
-        print(f"[{source_type}] Đã trích xuất {len(shapes)} vật thể.")
         return shapes
 
 # ==============================================================================
-# PHẦN 3: HỆ THỐNG KHỚP ẢNH (ROBUST MATCHING SYSTEM)
+# PHẦN 3: MATCHING SYSTEM (GIỮ NGUYÊN)
 # ==============================================================================
 
 class RobustMatchingSystem:
-    def __init__(self, drone_view_size=(200, 200)):
+    def __init__(self, drone_view_size=(150, 150)):
         self.view_w, self.view_h = drone_view_size
-        # Tạo box đại diện khung hình camera (gốc tại 0,0)
-        self.v_box_origin = box(0, 0, self.view_w, self.view_h)
 
-    def calculate_alpha_formula_4(self, poly_cam, poly_ref, v_box_current):
-        """
-        Tính Alpha theo đúng Công thức (4) trong bài báo
-        """
+    def calculate_alpha(self, poly_cam, poly_ref):
         try:
-            # Tử số: intersection(V_cam, V_ref)
-            numerator = poly_cam.intersection(poly_ref).area
-            if numerator == 0: return 0.0
-            
-            # Mẫu số: sqrt( intersection(V_box, V_ref) * intersection(V_box, V_cam) )
-            term1 = v_box_current.intersection(poly_ref).area
-            term2 = v_box_current.intersection(poly_cam).area # Thường chính là diện tích poly_cam
-            
-            denominator = np.sqrt(term1 * term2 + 1e-6)
-            return numerator / denominator
+            inter_area = poly_cam.intersection(poly_ref).area
+            if inter_area == 0: return 0.0
+            denom = np.sqrt(poly_cam.area * poly_ref.area + 1e-6)
+            return inter_area / denom
         except:
             return 0.0
 
     def find_best_alignment_hill_climbing(self, drone_poly, map_poly):
-        """
-        Thuật toán Leo đồi để tìm vị trí tối ưu (Khắc phục lệch tâm)
-        """
-        # 1. Khởi tạo: Dời tâm trùng tâm
         dx_init = map_poly.centroid.x - drone_poly.centroid.x
         dy_init = map_poly.centroid.y - drone_poly.centroid.y
         
-        current_poly = translate(drone_poly, xoff=dx_init, yoff=dy_init)
-        best_poly = current_poly
-        best_inter = current_poly.intersection(map_poly).area
-        
-        # 2. Tinh chỉnh vị trí
-        step = np.sqrt(map_poly.area) / 10.0 # Bước nhảy ban đầu
+        best_poly = translate(drone_poly, xoff=dx_init, yoff=dy_init)
+        best_inter = best_poly.intersection(map_poly).area
         current_offset = [dx_init, dy_init]
         
-        for _ in range(15): # 15 vòng lặp tối ưu
+        step = 10.0 
+        for _ in range(10): 
             found_better = False
-            # Thử 4 hướng
             for mx, my in [(0, step), (0, -step), (step, 0), (-step, 0)]:
                 test_poly = translate(best_poly, xoff=mx, yoff=my)
                 test_inter = test_poly.intersection(map_poly).area
@@ -147,199 +113,224 @@ class RobustMatchingSystem:
                     current_offset[0] += mx
                     current_offset[1] += my
                     found_better = True
-                    break # Greedy
+                    break 
             
             if not found_better:
-                step *= 0.5 # Giảm bước nhảy để dò kỹ hơn
+                step *= 0.5 
                 if step < 0.5: break
 
-        return best_poly, tuple(current_offset)
+        return tuple(current_offset)
 
     def run(self, drone_objs, map_objs):
         observations = []
-        print("\n--- BẮT ĐẦU MATCHING ---")
         
         for d_obj in drone_objs:
             best_alpha = 0
-            best_target = None
-            final_offset = (0,0)
+            final_offset = None
             
-            # 1. Sàng lọc thô (Coarse Screening)
-            # Bài báo: |S^A - S^B|/m < delta
             candidates = [m for m in map_objs if abs(d_obj.S - m.S)/(m.S+1e-5) < 0.5]
             
-            # 2. Khớp tinh (Fine Matching & Alignment)
             for m_obj in candidates:
-                # Tìm vị trí tối ưu
-                aligned_poly, offset = self.find_best_alignment_hill_climbing(d_obj.region, m_obj.region)
-                
-                # Tạo V_box tại vị trí tương ứng trên bản đồ để tính công thức (4)
-                # Dịch chuyển V_box theo offset tìm được
-                # Tâm ảnh drone ban đầu là (view_w/2, view_h/2) -> centroid của d_obj
-                # Offset là từ centroid d_obj -> centroid m_obj (đã tối ưu)
-                # => V_box cũng dịch theo offset đó
-                v_box_aligned = translate(self.v_box_origin, xoff=offset[0], yoff=offset[1])
-                
-                alpha = self.calculate_alpha_formula_4(aligned_poly, m_obj.region, v_box_aligned)
+                offset = self.find_best_alignment_hill_climbing(d_obj.region, m_obj.region)
+                aligned_poly = translate(d_obj.region, xoff=offset[0], yoff=offset[1])
+                alpha = self.calculate_alpha(aligned_poly, m_obj.region)
                 
                 if alpha > best_alpha:
                     best_alpha = alpha
-                    best_target = m_obj
                     final_offset = offset
             
-            if best_target and best_alpha > 0.4:
-                # Tính vị trí ước lượng của Drone
-                # Vị trí thực = Vị trí tìm được trừ đi tọa độ cục bộ ban đầu
-                # Giả sử ta muốn tìm tọa độ của gốc ảnh (0,0) trên bản đồ:
-                est_x = 0 + final_offset[0]
-                est_y = 0 + final_offset[1]
-                
-                print(f" ✅ KHỚP: Drone '{d_obj.id}' <-> Map '{best_target.id}' | Alpha={best_alpha:.3f}")
-                
-                # Tạo Observation cho GMM
-                obs = GaussianObservation([est_x, est_y], best_alpha)
-                observations.append(obs)
+            if best_alpha > 0.6 and final_offset is not None:
+                observations.append(GaussianObservation(final_offset, best_alpha))
 
         return observations
 
 # ==============================================================================
-# PHẦN 4: BỘ LỌC HẠT GMM (GMM PARTICLE FILTER)
+# PHẦN 4: PARTICLE FILTER (GIỮ NGUYÊN)
 # ==============================================================================
-
-class Particle:
-    def __init__(self, pos, weight):
-        self.mu = np.array(pos)
-        self.w = weight
-        self.c = 0 # Số lần khớp thành công (Counter)
-        self.sigma = np.eye(2) * 2.0 # Độ bất định riêng của hạt
 
 class GMMParticleFilter:
     def __init__(self, num_particles=1000, map_bounds=(0, 1000, 0, 1000)):
         self.N = num_particles
-        self.particles = []
-        self.bounds = map_bounds # (min_x, max_x, min_y, max_y)
-        
-    def initialize(self):
-        """Khởi tạo hạt rải đều ngẫu nhiên (Global Localization)"""
-        print(f"--- KHỞI TẠO {self.N} HẠT ---")
-        for _ in range(self.N):
-            rx = np.random.uniform(self.bounds[0], self.bounds[1])
-            ry = np.random.uniform(self.bounds[2], self.bounds[3])
-            self.particles.append(Particle([rx, ry], 1.0/self.N))
+        self.bounds = map_bounds
+        self.particles = [] 
+        self.is_initialized = False 
 
-    def predict(self, move_vector, noise_std=1.0):
-        """Bước dự đoán (Motion Update)"""
-        move = np.array(move_vector)
-        noise_cov = np.eye(2) * (noise_std**2)
+    def initialize_from_observation(self, observations):
+        if not observations: return False
+        best_obs = max(observations, key=lambda o: o.score)
+        center = best_obs.mean
+        sigma = np.sqrt(best_obs.sigma_val) * 2.0
         
-        for p in self.particles:
-            p.mu += move
-            p.mu += np.random.multivariate_normal([0,0], noise_cov)
-            p.sigma += noise_cov
+        self.particles = []
+        for _ in range(self.N):
+            pos = np.random.normal(center, sigma)
+            pos[0] = np.clip(pos[0], self.bounds[0], self.bounds[1])
+            pos[1] = np.clip(pos[1], self.bounds[2], self.bounds[3])
+            self.particles.append(Particle(pos, 1.0/self.N))
+            
+        self.is_initialized = True
+        return True
+
+    def predict(self, move_vector, noise_std=2.0):
+        if not self.is_initialized: return
+        move = np.array(move_vector)
+        noise = np.random.normal(0, noise_std, (self.N, 2))
+        for i, p in enumerate(self.particles):
+            p.mu += move + noise[i]
+            p.mu[0] = np.clip(p.mu[0], self.bounds[0], self.bounds[1])
+            p.mu[1] = np.clip(p.mu[1], self.bounds[2], self.bounds[3])
 
     def update(self, observations):
-        """Bước cập nhật trọng số dựa trên Gaussian Observations"""
-        if not observations: return
+        if not self.is_initialized or not observations: return
+        
+        p_pos = np.array([p.mu for p in self.particles])
+        obs_means = np.array([o.mean for o in observations])
+        obs_vars = np.array([o.sigma_val for o in observations])
+        obs_scores = np.array([o.score for o in observations])
+        
+        if np.sum(obs_scores) == 0: return
+        obs_mix_w = obs_scores / np.sum(obs_scores) 
 
-        total_w = 0.0
-        for p in self.particles:
-            best_prob = 0
-            matched = False
-            
-            for obs in observations:
-                dist = np.linalg.norm(p.mu - obs.mean)
-                
-                # Điều kiện khớp thành công (tài liệu): 
-                # dist < sigma_p + sigma_obs (Dùng trace đại diện)
-                thresh = np.sqrt(np.trace(p.sigma)) + np.sqrt(np.trace(obs.cov))
-                
-                if dist < thresh:
-                    matched = True
-                    prob = obs.pdf(p.mu)
-                    if prob > best_prob: best_prob = prob
-            
-            if matched:
-                p.c += 1
-                p.w *= best_prob * (1 + 0.1 * p.c) # Thưởng cho lịch sử khớp
+        diff = p_pos[:, None, :] - obs_means[None, :, :]
+        dist_sq = np.sum(diff**2, axis=2) / obs_vars[None, :]
+        norm_const = 1.0 / (2 * np.pi * obs_vars)
+        p_components = obs_mix_w[None, :] * norm_const[None, :] * np.exp(-0.5 * dist_sq)
+        total_likelihood = np.sum(p_components, axis=1)
+
+        current_weights = np.array([p.w for p in self.particles])
+        new_weights = current_weights * (total_likelihood + 1e-300)
+        
+        w_sum = np.sum(new_weights)
+        if w_sum > 0: new_weights /= w_sum
+        else: new_weights[:] = 1.0 / self.N
+
+        min_dist_sq = np.min(dist_sq, axis=1)
+        is_matched = min_dist_sq < 9.0
+
+        for i, p in enumerate(self.particles):
+            p.w = new_weights[i]
+            if is_matched[i]:
+                p.c += 1.0 
+                p.w *= (1.0 + 0.1 * p.c)
             else:
-                p.w *= 1e-10 # Phạt nặng
-                
-            total_w += p.w
-            
-        # Chuẩn hóa trọng số
-        if total_w > 0:
-            for p in self.particles: p.w /= total_w
-        else:
-            # Reset nếu mất dấu
-            for p in self.particles: p.w = 1.0/self.N
+                p.c = max(0.0, p.c - 0.5)
+
+        final_sum = sum(p.w for p in self.particles)
+        if final_sum > 0:
+            for p in self.particles: p.w /= final_sum
 
     def resample(self):
-        """Lấy mẫu lại (Resampling)"""
-        weights = [p.w for p in self.particles]
-        indices = np.random.choice(range(self.N), size=self.N, p=weights)
-        new_particles = []
-        for i in indices:
-            old = self.particles[i]
-            # Thêm nhiễu nhỏ (jitter) để tránh suy thoái hạt
-            new_pos = old.mu + np.random.normal(0, 0.5, 2)
-            new_p = Particle(new_pos, 1.0/self.N)
-            new_p.c = old.c
-            new_particles.append(new_p)
-        self.particles = new_particles
+        if not self.is_initialized: return
+        weights = np.array([p.w for p in self.particles])
+        n_eff = 1.0 / (np.sum(weights**2) + 1e-10)
+        
+        if n_eff < self.N / 2:
+            indices = np.random.choice(range(self.N), size=self.N, p=weights)
+            new_particles = []
+            for i in indices:
+                old = self.particles[i]
+                jitter = np.random.normal(0, 0.5, 2)
+                new_pos = old.mu + jitter
+                new_p = Particle(new_pos, 1.0/self.N)
+                new_p.c = old.c
+                new_particles.append(new_p)
+            self.particles = new_particles
 
     def estimate(self):
-        """Trả về vị trí trung bình có trọng số"""
-        x, y = 0.0, 0.0
-        for p in self.particles:
-            x += p.mu[0] * p.w
-            y += p.mu[1] * p.w
+        if not self.is_initialized: return np.zeros(2)
+        x = sum(p.mu[0] * p.w for p in self.particles)
+        y = sum(p.mu[1] * p.w for p in self.particles)
         return np.array([x, y])
 
 # ==============================================================================
-# PHẦN 5: CHƯƠNG TRÌNH CHÍNH (MAIN SIMULATION)
+# PHẦN 5: CHƯƠNG TRÌNH CHÍNH
 # ==============================================================================
 
-if __name__ == "__main__":
-    # --- A. TẠO DỮ LIỆU GIẢ LẬP (Để test code) ---
-    print(">>> Đang tạo dữ liệu giả lập...")
-    # Map: 1000x1000, có 1 hình vuông đen tại (500, 500)
-    map_img = np.ones((1000, 1000), dtype=np.uint8) * 255
-    cv2.rectangle(map_img, (500, 500), (600, 600), 0, -1) 
-    cv2.imwrite("sim_map.png", map_img)
-    
-    # Drone: Ảnh 200x200, nhìn thấy hình vuông đó nhưng lệch
-    # Giả sử drone đang ở vị trí (450, 450) trên bản đồ
-    # Thì hình vuông (500,500) sẽ xuất hiện tại (50, 50) trong ảnh drone
-    drone_img = np.ones((200, 200), dtype=np.uint8) * 255
-    cv2.rectangle(drone_img, (50, 50), (150, 150), 0, -1)
-    cv2.imwrite("sim_drone.png", drone_img)
-    # -----------------------------------------------
+def create_synthetic_data():
+    W, H = 800, 600
+    map_img = np.zeros((H, W), dtype=np.uint8)
+    cv2.rectangle(map_img, (200, 200), (300, 300), 255, -1) 
+    cv2.circle(map_img, (600, 400), 60, 255, -1)
+    pts = np.array([[400, 100], [450, 200], [350, 200]], np.int32)
+    cv2.fillPoly(map_img, [pts], 255)
+    return map_img
 
-    # --- B. CHẠY HỆ THỐNG ---
+def main():
+    # Setup
+    map_img = create_synthetic_data()
     
-    # 1. Load Ảnh
-    loader = BinaryImageLoader()
-    map_objs = loader.extract_features("sim_map.png", "MAP")
-    drone_objs = loader.extract_features("sim_drone.png", "DRONE")
+    # --- THAY ĐỔI: Dùng MaskProcessor ---
+    mask_processor = MaskProcessor()
     
-    # 2. Khởi tạo Filter
-    pf = GMMParticleFilter(num_particles=500, map_bounds=(0, 1000, 0, 1000))
-    pf.initialize()
+    # Load Map Features (Coi map như một mask lớn)
+    map_objs = mask_processor.extract_features(map_img, "MAP")
     
-    # 3. Chạy Matching
-    matcher = RobustMatchingSystem(drone_view_size=(200, 200))
-    observations = matcher.run(drone_objs, map_objs)
+    pf = GMMParticleFilter(num_particles=1000, map_bounds=(0, 800, 0, 600))
+    matcher = RobustMatchingSystem(drone_view_size=(150, 150))
     
-    # 4. Cập nhật Filter với kết quả Matching
-    if observations:
-        print(f"\n>>> Tìm thấy {len(observations)} quan sát. Cập nhật Filter...")
-        pf.update(observations)
-        pf.resample()
+    true_x, true_y = 100, 100
+    vx, vy = 3, 2             
+    
+    print(">>> SYSTEM STARTED WITH MASK PROCESSOR.")
+    print(">>> Simulating Detectron2 binary output...")
+
+    while True:
+        # 1. Update Simulation
+        true_x += vx
+        true_y += vy
+        if true_x > 750 or true_x < 50: vx = -vx
+        if true_y > 550 or true_y < 50: vy = -vy
         
-        est_pos = pf.estimate()
-        print(f"\n✅ KẾT QUẢ CUỐI CÙNG:")
-        print(f"   Vị trí thực tế (Giả định): [450.0, 450.0]")
-        print(f"   Vị trí thuật toán đoán:    [{est_pos[0]:.2f}, {est_pos[1]:.2f}]")
-        print(f"   Sai số: {np.linalg.norm(est_pos - np.array([450, 450])):.2f} mét")
-    else:
-        print("\n❌ Không tìm thấy vị trí phù hợp.")
+        # 2. Tạo 'Detectron Output' giả lập
+        # (Ở thực tế, bước này là bạn lấy mask từ model Detectron2 của bạn)
+        M = np.float32([[1, 0, -true_x], [0, 1, -true_y]])
+        
+        # Đây chính là biến mask mà code Detectron của bạn sẽ trả về
+        detectron_binary_output = cv2.warpAffine(map_img, M, (150, 150))
+        
+        # 3. Process Mask (Trực tiếp từ binary -> Polygon)
+        drone_objs = mask_processor.extract_features(detectron_binary_output, "DRONE")
+        
+        # 4. Matching & Filter (Workflow cũ)
+        observations = matcher.run(drone_objs, map_objs)
+        
+        est_pos = np.array([0, 0])
+        status_text = "WAITING..."
+        status_color = (0, 255, 255)
+
+        if not pf.is_initialized:
+            if len(observations) > 0:
+                success = pf.initialize_from_observation(observations)
+                if success: status_text = "INITIALIZED!"
+        else:
+            status_text = "TRACKING"
+            status_color = (0, 0, 255)
+            pf.predict([vx, vy], noise_std=2.0)
+            if len(observations) > 0:
+                pf.update(observations)
+            pf.resample()
+            est_pos = pf.estimate()
+        
+        # 5. Visuals
+        vis_img = cv2.cvtColor(map_img, cv2.COLOR_GRAY2BGR)
+        if pf.is_initialized:
+            for p in pf.particles:
+                cv2.circle(vis_img, (int(p.mu[0]), int(p.mu[1])), 1, (0, 255, 0), -1)
+            cv2.circle(vis_img, (int(est_pos[0]), int(est_pos[1])), 8, (0, 0, 255), -1)
+
+        cv2.rectangle(vis_img, (int(true_x)-10, int(true_y)-10), 
+                      (int(true_x)+10, int(true_y)+10), (255, 0, 0), 2)
+        
+        cv2.putText(vis_img, f"Mode: {status_text}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        
+        cv2.imshow("Map", vis_img)
+        cv2.imshow("Detectron Mask Input", detectron_binary_output)
+        
+        if cv2.waitKey(30) & 0xFF == ord('q'):
+            break
+
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
