@@ -1,381 +1,395 @@
 import cv2
 import numpy as np
-from shapely.geometry import Polygon
+import math
+from shapely.geometry import Polygon, Point
 from shapely.affinity import translate
-from shapely.strtree import STRtree  
+from shapely.ops import unary_union
 
 # ==============================================================================
-# PHẦN 1: CẤU TRÚC DỮ LIỆU
+# 1. SHAPE DESCRIPTOR (Giữ nguyên tư tưởng Eq. 1)
 # ==============================================================================
-
-class ShapePoint:
-    def __init__(self, id, polygon, source_type, contour):
-        self.id = id
-        self.region = polygon       
-        self.source = source_type   
-        self.S = polygon.area
-        self.centroid = np.array([polygon.centroid.x, polygon.centroid.y])
-        self.contour = contour
+class ShapeDescriptor:
+    def __init__(self):
+        # Bán kính các vòng tròn ngữ cảnh (r1, r2, r3)
+        self.radii = [30, 60, 90] 
+        self.sectors = 8
+     
+    def compute(self, target_poly, context_union):
+        """
+        Tính toán vector đặc trưng dựa trên giao diện tích của các vật thể xung quanh
+        với các rẻ quạt (sectors) và vành khuyên (rings).
+        """
+        cx, cy = target_poly.centroid.x, target_poly.centroid.y
+        center = Point(cx, cy)
+        vector = []
         
-        # Tính độ tròn (Circularity) để lọc hình dáng
-        perimeter = cv2.arcLength(contour, True)
-        if perimeter == 0: self.circularity = 0
-        else: self.circularity = 4 * np.pi * (self.S / (perimeter**2))
-
-class GaussianObservation:
-    def __init__(self, mean_pos, alpha_score):
-        self.mean = np.array(mean_pos) 
-        self.score = alpha_score        
-        # Score càng cao -> Sigma càng nhỏ (tin cậy cao)
-        base_sigma = 5.0 
-        min_sigma = 1.0  
-        val = (base_sigma / (alpha_score + 1e-6))
-        self.sigma_val = max(val, min_sigma)**2 
-
-class Particle:
-    def __init__(self, pos, weight):
-        self.mu = np.array(pos, dtype=np.float64)
-        self.w = weight
-
-# ==============================================================================
-# PHẦN 2: XỬ LÝ MASK (Extract Polygon)
-# ==============================================================================
-
-class MaskProcessor:
-    def extract_features(self, binary_mask, source_type):
-        if binary_mask is None: return []
-        
-        if binary_mask.dtype == bool:
-            mask_img = (binary_mask * 255).astype(np.uint8)
-        else:
-            mask_img = binary_mask.astype(np.uint8)
-            if np.max(mask_img) <= 1 and np.max(mask_img) > 0:
-                mask_img = mask_img * 255
-
-        contours, _ = cv2.findContours(mask_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        shapes = []
-        
-        for i, cnt in enumerate(contours):
-            if cv2.contourArea(cnt) < 50: continue 
-            
-            epsilon = 0.02 * cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, epsilon, True)
-            
-            if len(approx) >= 3:
-                pts = [tuple(pt[0]) for pt in approx]
-                poly = Polygon(pts)
-                if not poly.is_valid: poly = poly.buffer(0)
-                shapes.append(ShapePoint(f"{source_type}_{i}", poly, source_type, cnt))
-        return shapes
-
-# ==============================================================================
-# PHẦN 3: MATCHING SYSTEM (NO ROTATION - ONLY TRANSLATION)
-# ==============================================================================
-
-class RobustMatchingSystem:
-    def __init__(self, drone_view_size):
-        self.view_w, self.view_h = drone_view_size
-        self.map_tree = None
-        self.map_objects = []
-
-    def build_spatial_index(self, map_objs):
-        self.map_objects = map_objs
-        if not map_objs: return
-        geoms = [obj.region for obj in map_objs]
-        self.map_tree = STRtree(geoms)
-        print(f"[System] Built R-tree for {len(map_objs)} map objects.")
-
-    def get_nearby_candidates(self, center_pos, search_radius=300):
-        if self.map_tree is None or center_pos is None: 
-            return self.map_objects
-        
-        x, y = center_pos
-        search_box = Polygon([
-            (x - search_radius, y - search_radius),
-            (x + search_radius, y - search_radius),
-            (x + search_radius, y + search_radius),
-            (x - search_radius, y + search_radius)
-        ])
-        
-        indices = self.map_tree.query(search_box)
-        candidates = [self.map_objects[i] for i in indices]
-        return candidates
-
-    # [PHƯƠNG PHÁP CŨ CỦA BẠN] Hill Climbing - Tìm vị trí khớp nhất
-    def find_best_alignment_hill_climbing(self, drone_poly, map_poly):
-        # Bắt đầu dò từ vị trí chênh lệch tâm (centroid alignment)
-        c_dx = map_poly.centroid.x - drone_poly.centroid.x
-        c_dy = map_poly.centroid.y - drone_poly.centroid.y
-        
-        # Polygon khởi đầu
-        best_poly = translate(drone_poly, xoff=c_dx, yoff=c_dy)
-        try:
-            best_inter = best_poly.intersection(map_poly).area
-        except:
-            return (c_dx, c_dy), 0.0
-
-        current_offset = [c_dx, c_dy]
-        
-        step = 10.0 
-        max_iter = 15
-        
-        # Leo đồi để tinh chỉnh từng pixel
-        for _ in range(max_iter): 
-            found_better = False
-            for mx, my in [(0, step), (0, -step), (step, 0), (-step, 0)]:
-                test_poly = translate(best_poly, xoff=mx, yoff=my)
+        prev_r = 0
+        for r in self.radii:
+            for j in range(self.sectors):
+                angle_start = j * (360.0 / self.sectors)
+                angle_end = (j + 1) * (360.0 / self.sectors)
+                
+                # Tạo hình rẻ quạt (Wedge)
+                W = r * 2.5 
+                rad_s, rad_e = math.radians(angle_start), math.radians(angle_end)
+                wedge_poly = Polygon([
+                    (cx, cy),
+                    (cx + W*math.cos(rad_s), cy + W*math.sin(rad_s)),
+                    (cx + W*math.cos(rad_e), cy + W*math.sin(rad_e))
+                ])
+                
+                # Cắt lấy phần nằm trong Ring
+                ring = center.buffer(r).difference(center.buffer(prev_r))
+                sector_area = ring.intersection(wedge_poly)
+                
+                # Tính diện tích giao với ngữ cảnh (Context)
                 try:
-                    test_inter = test_poly.intersection(map_poly).area
-                except: continue
+                    val = sector_area.intersection(context_union).area
+                except:
+                    val = 0.0
+                vector.append(val)
+            prev_r = r
+        return np.array(vector)
 
-                if test_inter > best_inter:
-                    best_inter = test_inter
-                    best_poly = test_poly
-                    current_offset[0] += mx
-                    current_offset[1] += my
-                    found_better = True
-                    break 
-            
-            if not found_better:
-                step *= 0.5 
-                if step < 1.0: break
-
-        return tuple(current_offset), best_inter
-
-    def run(self, drone_objs, estimated_pos=None):
-        observations = []
+# ==============================================================================
+# 2. MATCHING SYSTEM (So khớp Coarse & Fine - Eq. 2, 4, 6)
+# ==============================================================================
+class StrictMatcher:
+    def __init__(self):
+        self.desc_engine = ShapeDescriptor()
         
-        # Tối ưu tìm kiếm bằng R-tree
-        if estimated_pos is not None:
-            candidates_pool = self.get_nearby_candidates(estimated_pos, search_radius=200)
-            if not candidates_pool: candidates_pool = self.map_objects
-        else:
-            candidates_pool = self.map_objects
-
-        for d_obj in drone_objs:
-            best_score = 0
-            final_offset = None
+    def find_matches(self, drone_polys, map_polys, map_descriptors, view_center_offset):
+        """
+        Input: Polygon từ Camera và Map.
+        Output: List các 'observations' (vị trí ước lượng, độ tin cậy).
+        """
+        observations = []
+        if not drone_polys: return []
+        
+        # Tạo ngữ cảnh (Context) cho view hiện tại
+        drone_context = unary_union(drone_polys)
+        
+        for d_poly in drone_polys:
+            # Tính descriptor cho vật thể đang xét
+            f_cam = self.desc_engine.compute(d_poly, drone_context)
             
-            # 1. Lọc Hình Dáng (Shape Check) - Tránh nhầm Tròn với Vuông
-            filtered_candidates = []
-            for m_obj in candidates_pool:
-                # So sánh contour (Hu Moments)
-                shape_dist = cv2.matchShapes(d_obj.contour, m_obj.contour, cv2.CONTOURS_MATCH_I1, 0)
-                # So sánh độ tròn
-                circ_diff = abs(d_obj.circularity - m_obj.circularity)
+            # --- Step 1: Coarse Matching (Eq. 2) ---
+            # So sánh khoảng cách vector Manhattan
+            candidates = []
+            for i, m_poly in enumerate(map_polys):
+                dist = np.sum(np.abs(f_cam - map_descriptors[i]))
+                candidates.append((dist, m_poly))
+            
+            # Lấy Top 5 ứng viên tốt nhất
+            candidates.sort(key=lambda x: x[0])
+            top_candidates = [x[1] for x in candidates[:5]]
+            
+            # --- Step 2: Fine Matching (Eq. 4) ---
+            # Geometric Verification
+            for m_poly in top_candidates:
+                # Dịch chuyển d_poly về vị trí của m_poly để so sánh hình dáng
+                dx = m_poly.centroid.x - d_poly.centroid.x
+                dy = m_poly.centroid.y - d_poly.centroid.y
+                aligned_cam = translate(d_poly, xoff=dx, yoff=dy)
                 
-                # Điều kiện lọc: Hình dạng phải tương đối giống nhau
-                if shape_dist < 0.2 and circ_diff < 0.3:
-                    filtered_candidates.append(m_obj)
-            
-            # 2. Matching Tinh (Hill Climbing)
-            for m_obj in filtered_candidates:
-                offset, inter_area = self.find_best_alignment_hill_climbing(d_obj.region, m_obj.region)
+                # Tính độ tương quan diện tích (Correlation Score)
+                inter_area = aligned_cam.intersection(m_poly).area
+                denom = math.sqrt(d_poly.area * m_poly.area) + 1e-6
+                alpha = inter_area / denom 
                 
-                # Tính IoU
-                union_area = d_obj.region.area + m_obj.region.area - inter_area
-                iou = inter_area / (union_area + 1e-6)
-
-                if iou > best_score:
-                    best_score = iou
-                    final_offset = offset
-            
-            # Nếu IoU đủ tốt (> 0.6), ghi nhận quan sát
-            if best_score > 0.6 and final_offset is not None:
-                # Chuyển đổi offset về tâm Camera
-                corrected_pos = (
-                    final_offset[0] + self.view_w / 2.0,
-                    final_offset[1] + self.view_h / 2.0
-                )
-                observations.append(GaussianObservation(corrected_pos, best_score))
-
+                # Ngưỡng chấp nhận (Empirical Parameter)
+                if alpha > 0.65: 
+                    # Tính vị trí Drone: Pos_Global = Obj_Global - (Obj_Local - Center_Cam)
+                    vec_rel_x = d_poly.centroid.x - view_center_offset[0]
+                    vec_rel_y = d_poly.centroid.y - view_center_offset[1]
+                    
+                    est_global_x = m_poly.centroid.x - vec_rel_x
+                    est_global_y = m_poly.centroid.y - vec_rel_y
+                    
+                    # Tính phương sai (Sigma) dựa trên độ khớp (Eq. 5 implied)
+                    # Score càng cao -> Sigma càng nhỏ (tin cậy cao)
+                    sigma = 30.0 * (1.0 - alpha) + 5.0
+                    
+                    observations.append({
+                        'mu': np.array([est_global_x, est_global_y]),
+                        'sigma': sigma,
+                        'score': alpha
+                    })
+                    
         return observations
 
 # ==============================================================================
-# PHẦN 4: PARTICLE FILTER (SMOOTH)
+# 3. PARTICLE FILTER (Fusion & Re-distribution - Đã tinh chỉnh)
 # ==============================================================================
-
-class GMMParticleFilter:
-    def __init__(self, num_particles=2000, map_bounds=(0, 1000, 0, 1000)):
-        self.N = num_particles
-        self.bounds = map_bounds
-        self.particles = [] 
-        self.is_initialized = False 
-
-    def initialize_from_observation(self, observations):
-        if not observations: return False
-        best_obs = max(observations, key=lambda o: o.score)
-        center = best_obs.mean
-        sigma = np.sqrt(best_obs.sigma_val) * 3.0
+class FusionParticleFilter:
+    def __init__(self, N, W, H):
+        self.N = N
+        self.W, self.H = W, H
+        self.particles_pos = np.zeros((N, 2))
+        self.particles_cov = np.ones(N) * 20.0 
+        self.weights = np.ones(N) / N
+        self.initialized = False
         
-        self.particles = []
-        for _ in range(self.N):
-            pos = np.random.normal(center, sigma)
-            pos[0] = np.clip(pos[0], self.bounds[0], self.bounds[1])
-            pos[1] = np.clip(pos[1], self.bounds[2], self.bounds[3])
-            self.particles.append(Particle(pos, 1.0/self.N))
-        self.is_initialized = True
-        return True
+        # Biến để làm mượt (Smoothing filter)
+        self.last_estimate = None
 
-    def predict(self, move_vector, noise_std=2.0):
-        if not self.is_initialized: return
-        move = np.array(move_vector)
-        noise = np.random.normal(0, noise_std, (self.N, 2))
-        for i, p in enumerate(self.particles):
-            p.mu += move + noise[i]
-            p.mu[0] = np.clip(p.mu[0], self.bounds[0], self.bounds[1])
-            p.mu[1] = np.clip(p.mu[1], self.bounds[2], self.bounds[3])
+    def init(self, x, y):
+        self.particles_pos[:, 0] = np.random.normal(x, 100, self.N)
+        self.particles_pos[:, 1] = np.random.normal(y, 100, self.N)
+        self.particles_cov[:] = 20.0
+        self.weights[:] = 1.0 / self.N
+        self.initialized = True
+        self.last_estimate = np.array([x, y])
 
-    def update(self, observations):
-        if not self.is_initialized or not observations: return
+    def propagate(self, velocity):
+        # --- Eq. 8: Prediction ---
+        noise = np.random.normal(0, 2.0, (self.N, 2))
+        self.particles_pos += velocity + noise
         
-        best_obs = max(observations, key=lambda o: o.score)
-        obs_mean = best_obs.mean
-        obs_var = best_obs.sigma_val
-        
-        p_pos = np.array([p.mu for p in self.particles])
-        diff = p_pos - obs_mean
-        dist_sq = np.sum(diff**2, axis=1)
-        
-        likelihood = np.exp(-0.5 * dist_sq / obs_var) + 1e-300
-        current_weights = np.array([p.w for p in self.particles])
-        new_weights = current_weights * likelihood
-        w_sum = np.sum(new_weights)
-        if w_sum > 0: new_weights /= w_sum
-        for i, p in enumerate(self.particles):
-            p.w = new_weights[i]
+        # Tăng Uncertainty theo thời gian (nhưng kẹp lại để ổn định)
+        self.particles_cov += 0.5
+        np.clip(self.particles_cov, 5.0, 40.0, out=self.particles_cov)
 
-    def resample(self):
-        if not self.is_initialized: return
-        weights = np.array([p.w for p in self.particles])
-        n_eff = 1.0 / (np.sum(weights**2) + 1e-10)
+        # Giới hạn trong bản đồ
+        np.clip(self.particles_pos[:, 0], 0, self.W, out=self.particles_pos[:, 0])
+        np.clip(self.particles_pos[:, 1], 0, self.H, out=self.particles_pos[:, 1])
+
+    def fusion_update(self, observations):
+        """
+        --- Eq. 9: Data Fusion Update ---
+        Cập nhật vị trí từng hạt dựa trên quan sát (Observation).
+        """
+        if not self.initialized or not observations: return
+
+        # Lấy quan sát tốt nhất
+        observations.sort(key=lambda x: x['score'], reverse=True)
+        best_obs = observations[0]
+
+        # Nếu độ tin cậy quá thấp, bỏ qua bước update vị trí (để tránh nhiễu)
+        if best_obs['score'] < 0.4: return
+
+        # Reset weights
+        self.weights.fill(1.e-20)
+
+        for i in range(self.N):
+            p_pos = self.particles_pos[i]
+            p_cov = self.particles_cov[i]
+            
+            dist = np.linalg.norm(p_pos - best_obs['mu'])
+            
+            # Gating: Chỉ update hạt nằm gần vùng quan sát (4 sigma)
+            combined_sigma = math.sqrt(p_cov) + best_obs['sigma']
+            
+            if dist < 4 * combined_sigma:
+                # --- Kalman Fusion ---
+                # R: Measurement Noise. 
+                R = (best_obs['sigma'] * 1.5)**2  
+                P = p_cov**2
+                
+                K = P / (P + R) # Kalman Gain
+                
+                # Cập nhật vị trí: Hạt bị hút về phía quan sát
+                innovation = best_obs['mu'] - p_pos
+                self.particles_pos[i] += K * innovation
+                
+                # Cập nhật Covariance
+                P_new = (1.0 - K) * P
+                self.particles_cov[i] = math.sqrt(P_new)
+                
+                # Tính lại Weight
+                lik = math.exp(-0.5 * (dist**2) / (R + 1e-6)) * best_obs['score']
+                self.weights[i] = lik + 1.e-20
+            else:
+                self.weights[i] = 1.e-20
+
+        # Chuẩn hóa weights
+        s = np.sum(self.weights)
+        if s > 0: self.weights /= s
+        else: self.weights[:] = 1.0 / self.N
+
+    def resample_and_redistribute(self, observations):
+        """
+        --- Eq. 10: Resampling & Re-distribution ---
+        Tái phân bố hạt khi tìm thấy đặc trưng khớp tốt.
+        """
+        if not self.initialized: return
         
-        if n_eff < self.N / 2:
-            indices = np.random.choice(range(self.N), size=self.N, p=weights)
-            new_particles = []
-            for i in indices:
-                old = self.particles[i]
-                jitter = np.random.normal(0, 1.0, 2) 
-                new_particles.append(Particle(old.mu + jitter, 1.0/self.N))
-            self.particles = new_particles
+        # 1. Standard Resampling (Low Variance)
+        cumulative_sum = np.cumsum(self.weights)
+        cumulative_sum[-1] = 1.0
+        step = 1.0 / self.N
+        r = np.random.uniform(0, step)
+        
+        indexes = []
+        idx = 0
+        for i in range(self.N):
+            val = r + i*step
+            while val > cumulative_sum[idx]:
+                idx = min(idx + 1, self.N - 1)
+            indexes.append(idx)
+            
+        self.particles_pos = self.particles_pos[indexes]
+        self.particles_cov = self.particles_cov[indexes]
+        self.weights[:] = 1.0 / self.N
+        
+        # 2. Re-distribution (Tái phân bố)
+        if observations:
+            best_obs = max(observations, key=lambda x: x['score'])
+            
+            # Chỉ tái phân bố khi Score rất cao (> 0.8)
+            if best_obs['score'] > 0.80:
+                # Chọn 5% số hạt để dời đi
+                num_redist = int(self.N * 0.05) 
+                idxs = np.random.choice(self.N, num_redist, replace=False)
+                
+                # Cưỡng ép dời các hạt này về vị trí khớp + nhiễu nhỏ
+                self.particles_pos[idxs] = best_obs['mu'] + np.random.normal(0, 5, (num_redist, 2))
+                self.particles_cov[idxs] = 10.0 # Reset covariance thấp
 
     def estimate(self):
-        if not self.is_initialized: return np.zeros(2)
-        x = sum(p.mu[0] * p.w for p in self.particles)
-        y = sum(p.mu[1] * p.w for p in self.particles)
-        return np.array([x, y])
+        """
+        Tính toán vị trí cuối cùng (Dùng Median và Smoothing)
+        """
+        if not self.initialized: return 0,0
+        
+        # Dùng Median (Trung vị) để loại bỏ nhiễu ngoại lai
+        est_x = np.median(self.particles_pos[:, 0])
+        est_y = np.median(self.particles_pos[:, 1])
+        
+        current_est = np.array([est_x, est_y])
+        
+        # Low Pass Filter (Làm mượt chuyển động)
+        if self.last_estimate is None:
+            self.last_estimate = current_est
+        else:
+            alpha = 0.3 
+            self.last_estimate = (1 - alpha) * self.last_estimate + alpha * current_est
+            
+        return self.last_estimate[0], self.last_estimate[1]
 
 # ==============================================================================
-# PHẦN 5: CHƯƠNG TRÌNH CHÍNH (SIMULATION - NO ROTATION)
+# 4. MAP & UTILS
 # ==============================================================================
-
-def create_synthetic_map():
-    W, H = 800, 600
-    map_img = np.zeros((H, W), dtype=np.uint8)
+def create_city_map(W, H):
+    img = np.zeros((H, W), dtype=np.uint8)
+    np.random.seed(42) # Cố định map
     
-    # Bản đồ tĩnh
-    cv2.rectangle(map_img, (200, 200), (300, 300), 255, -1) # Vuông
-    cv2.circle(map_img, (600, 400), 60, 255, -1)            # Tròn
-    pts = np.array([[400, 100], [450, 200], [350, 200]], np.int32) # Tam giác
-    cv2.fillPoly(map_img, [pts], 255)
-    
-    cv2.rectangle(map_img, (50, 450), (150, 500), 255, -1) # Chữ nhật dài
-    return map_img
+    # Vẽ các tòa nhà ngẫu nhiên
+    for i in range(25):
+        x, y = np.random.randint(50, W-100), np.random.randint(50, H-100)
+        w, h = np.random.randint(50, 100), np.random.randint(50, 100)
+        cv2.rectangle(img, (x, y), (x+w, y+h), 255, -1)
+        
+        # Thêm chi tiết phụ để tạo shape phức tạp
+        if np.random.rand() > 0.5:
+             cv2.rectangle(img, (x+w//2, y+h//2), (x+w+20, y+h+20), 255, -1)
+             
+    # Vẽ Landmark đặc biệt (Chữ thập)
+    cx, cy = W//2, H//2
+    cv2.rectangle(img, (cx-20, cy-80), (cx+20, cy+80), 255, -1)
+    cv2.rectangle(img, (cx-80, cy-20), (cx+80, cy+20), 255, -1)
+    return img
 
+def get_polygons_from_image(image):
+    contours, _ = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    polys = []
+    for c in contours:
+        if cv2.contourArea(c) > 50:
+            approx = cv2.approxPolyDP(c, 0.02*cv2.arcLength(c, True), True)
+            if len(approx) >= 3:
+                p = Polygon(approx.reshape(-1, 2))
+                if not p.is_valid: p = p.buffer(0) # Fix invalid polygon
+                polys.append(p)
+    return polys
+
+# ==============================================================================
+# 5. MAIN
+# ==============================================================================
 def main():
-    map_img = create_synthetic_map()
-    mask_processor = MaskProcessor()
+    W, H = 1200, 800
+    VIEW_SIZE = 250 # Kích thước vùng nhìn camera
     
-    # Extract bản đồ
-    map_objs = mask_processor.extract_features(map_img, "MAP")
+    # 1. Setup Map
+    map_img = create_city_map(W, H)
+    map_polys = get_polygons_from_image(map_img)
+    map_context = unary_union(map_polys)
     
-    # Cấu hình
-    VIEW_W, VIEW_H = 150, 150
-    matcher = RobustMatchingSystem(drone_view_size=(VIEW_W, VIEW_H))
-    matcher.build_spatial_index(map_objs) 
+    # 2. Setup System
+    matcher = StrictMatcher()
+    # Pre-compute Map Descriptors
+    print("Computing Map Descriptors...")
+    map_descriptors = [matcher.desc_engine.compute(p, map_context) for p in map_polys]
     
-    pf = GMMParticleFilter(num_particles=5000, map_bounds=(0, 800, 0, 600))
+    # Tăng số lượng hạt lên 500 để mượt hơn
+    pf = FusionParticleFilter(N=5000, W=W, H=H)
     
-    true_x, true_y = 100, 100
-    vx, vy = 3, 2             
+    # Drone Pose & Velocity
+    drone_pos = np.array([300.0, 200.0]) 
+    velocity = np.array([3.0, 1.5]) 
     
-    print(">>> SIMULATION STARTED: Translation Only (X, Y). No Rotation.")
+    # Init hạt lệch vị trí để test khả năng hội tụ
+    pf.init(drone_pos[0] + 50, drone_pos[1] - 50) 
+
+    print("Running Simulation. Press 'ESC' to exit.")
 
     while True:
-        # Cập nhật vị trí
-        true_x += vx
-        true_y += vy
-        if true_x > 750 or true_x < 50: vx = -vx
-        if true_y > 550 or true_y < 50: vy = -vy
+        # --- A. ENVIRONMENT SIMULATION ---
+        drone_pos += velocity
+        # Bounce logic
+        if drone_pos[0] < VIEW_SIZE or drone_pos[0] > W-VIEW_SIZE: velocity[0] *= -1
+        if drone_pos[1] < VIEW_SIZE or drone_pos[1] > H-VIEW_SIZE: velocity[1] *= -1
         
-        # GIẢ LẬP CAMERA (Cắt trực tiếp từ map, không xoay)
-        top_left_x = int(true_x - VIEW_W // 2)
-        top_left_y = int(true_y - VIEW_H // 2)
+        # Camera Capture (Crop & Warp)
+        M = np.float32([[1, 0, -drone_pos[0] + VIEW_SIZE/2], [0, 1, -drone_pos[1] + VIEW_SIZE/2]])
+        cam_view = cv2.warpAffine(map_img, M, (VIEW_SIZE, VIEW_SIZE))
+        drone_polys = get_polygons_from_image(cam_view)
         
-        # Xử lý biên để không bị crash khi ra khỏi map
-        if top_left_x < 0 or top_left_y < 0 or \
-           top_left_x + VIEW_W > map_img.shape[1] or \
-           top_left_y + VIEW_H > map_img.shape[0]:
-            # Đơn giản là đổi chiều nếu chạm biên để demo
-            vx = -vx
-            vy = -vy
-            continue
+        # --- B. ALGORITHM EXECUTION ---
+        
+        # 1. Propagate (Dự đoán chuyển động)
+        pf.propagate(velocity)
+        
+        # 2. Matching (So khớp ngữ cảnh)
+        matches = matcher.find_matches(drone_polys, map_polys, map_descriptors, 
+                                     view_center_offset=(VIEW_SIZE/2, VIEW_SIZE/2))
+        
+        # 3. Fusion Update (Eq. 9) - Cập nhật vị trí hạt
+        if matches:
+            pf.fusion_update(matches)
+            
+        # 4. Resample & Re-distribution (Eq. 10) - Tái phân bố hạt
+        pf.resample_and_redistribute(matches)
+        
+        # 5. Estimate Result
+        est_x, est_y = pf.estimate()
+        
+        # --- C. VISUALIZATION ---
+        vis = cv2.cvtColor(map_img, cv2.COLOR_GRAY2BGR)
+        
+        # Draw Drone
+        top_left = (int(drone_pos[0]-VIEW_SIZE/2), int(drone_pos[1]-VIEW_SIZE/2))
+        cv2.rectangle(vis, top_left, (top_left[0]+VIEW_SIZE, top_left[1]+VIEW_SIZE), (0, 165, 255), 2)
+        cv2.putText(vis, "DRONE", (top_left[0], top_left[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        
+        # Draw Particles (vẽ ít thôi cho đỡ rối)
+        for p in pf.particles_pos[::2]:
+            cv2.circle(vis, (int(p[0]), int(p[1])), 1, (0, 255, 0), -1)
+            
+        # Draw Estimate
+        cv2.circle(vis, (int(est_x), int(est_y)), 8, (0, 0, 255), -1)
+        cv2.putText(vis, "ESTIMATE", (int(est_x)+10, int(est_y)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-        drone_view_img = map_img[top_left_y : top_left_y + VIEW_H, 
-                                 top_left_x : top_left_x + VIEW_W].copy()
+        # UI Info
+        best_score = max([m['score'] for m in matches]) if matches else 0.0
+        cv2.putText(vis, f"Match Score: {best_score:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         
-        # --- PROCESSING ---
-        drone_objs = mask_processor.extract_features(drone_view_img, "DRONE")
-        
-        # Lấy estimate cũ
-        search_hint = pf.estimate() if pf.is_initialized else None
-        
-        # Chạy Matching (Không cần quét góc)
-        observations = matcher.run(drone_objs, estimated_pos=search_hint)
-        
-        # Particle Filter Update
-        est_pos = np.array([0, 0])
-        status_text = "LOST / SEARCHING"
-        status_color = (0, 255, 255)
+        # PiP View (Góc dưới trái)
+        pip = cv2.cvtColor(cv2.resize(cam_view, (200, 200)), cv2.COLOR_GRAY2BGR)
+        vis[H-210:H-10, 10:210] = pip
+        cv2.rectangle(vis, (10, H-210), (210, H-10), (0, 255, 255), 2)
 
-        if not pf.is_initialized:
-            if len(observations) > 0:
-                pf.initialize_from_observation(observations)
-                status_text = "INITIALIZED!"
-        else:
-            status_text = "TRACKING"
-            status_color = (0, 0, 255)
-            pf.predict([vx, vy], noise_std=1.5)
-            if len(observations) > 0:
-                pf.update(observations)
-            pf.resample()
-            est_pos = pf.estimate()
-        
-        # --- VISUALIZATION ---
-        vis_img = cv2.cvtColor(map_img, cv2.COLOR_GRAY2BGR)
-        
-        if pf.is_initialized:
-            # Vẽ hạt
-            for p in pf.particles[::10]: 
-                cv2.circle(vis_img, (int(p.mu[0]), int(p.mu[1])), 1, (0, 255, 0), -1)
-            # Vẽ vị trí ước lượng (Đỏ)
-            cv2.circle(vis_img, (int(est_pos[0]), int(est_pos[1])), 6, (0, 0, 255), -1)
-
-        # Vẽ khung nhìn thực tế (Vàng)
-        cv2.rectangle(vis_img, (top_left_x, top_left_y), 
-                      (top_left_x + VIEW_W, top_left_y + VIEW_H), (255, 255, 0), 2)
-        
-        cv2.putText(vis_img, f"Status: {status_text}", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-        
-        cv2.imshow("Map Tracking", vis_img)
-        
-        cam_vis = cv2.cvtColor(drone_view_img, cv2.COLOR_GRAY2BGR)
-        cv2.circle(cam_vis, (VIEW_W//2, VIEW_H//2), 3, (0,0,255), -1)
-        cv2.imshow("Drone Camera View", cam_vis)
-        
-        if cv2.waitKey(30) & 0xFF == ord('q'):
-            break
+        cv2.imshow("CFBVM Simulation (Fusion + Redistribution)", vis)
+        if cv2.waitKey(20) == 27: break # ESC to quit
 
     cv2.destroyAllWindows()
 
