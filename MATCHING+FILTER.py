@@ -1,335 +1,386 @@
 import cv2
 import numpy as np
-from shapely.geometry import Polygon
-from shapely.affinity import translate, scale
+import math
+from shapely.geometry import Polygon, Point
+from shapely.affinity import translate, rotate
 
+from MAPPING import DroneController
 # ==============================================================================
-# PHẦN 1: CẤU TRÚC DỮ LIỆU (GIỮ NGUYÊN)
+# 1. CLASS PARTICLE FILTER (GIỮ NGUYÊN CODE CỦA BẠN)
 # ==============================================================================
-
-class ShapePoint:
-    def __init__(self, id, polygon, source_type):
-        self.id = id
-        self.region = polygon       
-        self.source = source_type   
-        self.S = polygon.area
-        self.centroid = np.array([polygon.centroid.x, polygon.centroid.y])
-
-class GaussianObservation:
-    def __init__(self, mean_pos, alpha_score):
-        self.mean = np.array(mean_pos) 
-        self.score = alpha_score       
-        self.sigma_val = (5.0 / (alpha_score + 1e-6))**2 
-
-class Particle:
-    def __init__(self, pos, weight):
-        self.mu = np.array(pos, dtype=np.float64)
-        self.w = weight
-        self.c = 0.0 
-
-# ==============================================================================
-# PHẦN 2: XỬ LÝ MASK TỪ AI (THAY THẾ LOADER CŨ)
-# ==============================================================================
-
-class MaskProcessor:
-    """
-    Class này nhận đầu vào là ảnh nhị phân (Binary Mask) từ Detectron2
-    và chuyển đổi trực tiếp sang ShapePoint. Bỏ qua bước thresholding thừa thãi.
-    """
-    def extract_features(self, binary_mask, source_type, scale_ratio=1.0):
-        # Input: binary_mask là numpy array (0 và 1 hoặc 0 và 255)
-        if binary_mask is None: return []
-
-        # Đảm bảo format uint8 cho OpenCV
-        if binary_mask.dtype == bool:
-            mask_img = (binary_mask * 255).astype(np.uint8)
-        else:
-            mask_img = binary_mask.astype(np.uint8)
-            # Nếu mask là float 0-1, scale lên 255
-            if np.max(mask_img) <= 1 and np.max(mask_img) > 0:
-                mask_img = mask_img * 255
-
-        # Tìm contours trực tiếp trên mask
-        contours, _ = cv2.findContours(mask_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        shapes = []
-
-        for i, cnt in enumerate(contours):
-            # Bỏ qua nhiễu nhỏ
-            if cv2.contourArea(cnt) < 50: continue 
-
-            # Xấp xỉ đa giác
-            epsilon = 0.02 * cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, epsilon, True)
-
-            if len(approx) >= 3:
-                pts = [tuple(pt[0]) for pt in approx]
-                poly = Polygon(pts)
-                
-                # Fix lỗi hình học
-                if not poly.is_valid: poly = poly.buffer(0)
-                
-                if scale_ratio != 1.0:
-                    poly = scale(poly, xfact=scale_ratio, yfact=scale_ratio, origin=(0,0))
-
-                shapes.append(ShapePoint(f"{source_type}_{i}", poly, source_type))
-
-        return shapes
-
-# ==============================================================================
-# PHẦN 3: MATCHING SYSTEM (GIỮ NGUYÊN)
-# ==============================================================================
-
-class RobustMatchingSystem:
-    def __init__(self, drone_view_size=(150, 150)):
-        self.view_w, self.view_h = drone_view_size
-
-    def calculate_alpha(self, poly_cam, poly_ref):
-        try:
-            inter_area = poly_cam.intersection(poly_ref).area
-            if inter_area == 0: return 0.0
-            denom = np.sqrt(poly_cam.area * poly_ref.area + 1e-6)
-            return inter_area / denom
-        except:
-            return 0.0
-
-    def find_best_alignment_hill_climbing(self, drone_poly, map_poly):
-        dx_init = map_poly.centroid.x - drone_poly.centroid.x
-        dy_init = map_poly.centroid.y - drone_poly.centroid.y
+class PaperCompliantPF:
+    def __init__(self, N, W, H):
+        self.N = N  # Số lượng hạt
+        self.W = W  # Chiều rộng Map
+        self.H = H  # Chiều cao Map
         
-        best_poly = translate(drone_poly, xoff=dx_init, yoff=dy_init)
-        best_inter = best_poly.intersection(map_poly).area
-        current_offset = [dx_init, dy_init]
+        # Eq. 7: Khởi tạo hạt
+        self.particles = np.zeros((N, 2)) 
+        self.weights = np.ones(N) / N
+        self.initialized = False
         
-        step = 10.0 
-        for _ in range(10): 
-            found_better = False
-            for mx, my in [(0, step), (0, -step), (step, 0), (-step, 0)]:
-                test_poly = translate(best_poly, xoff=mx, yoff=my)
-                test_inter = test_poly.intersection(map_poly).area
-                
-                if test_inter > best_inter:
-                    best_inter = test_inter
-                    best_poly = test_poly
-                    current_offset[0] += mx
-                    current_offset[1] += my
-                    found_better = True
-                    break 
-            
-            if not found_better:
-                step *= 0.5 
-                if step < 0.5: break
+        # Process Noise
+        self.process_noise = 2.0 
 
-        return tuple(current_offset)
+    def init(self, x, y):
+        self.particles[:, 0] = np.random.normal(x, 50, self.N)
+        self.particles[:, 1] = np.random.normal(y, 50, self.N)
+        self.initialized = True
 
-    def run(self, drone_objs, map_objs):
-        observations = []
+    # Eq. 8: Propagation
+    def propagate(self, velocity):
+        noise = np.random.normal(0, self.process_noise, (self.N, 2))
+        self.particles += velocity + noise
+        np.clip(self.particles[:, 0], 0, self.W, out=self.particles[:, 0])
+        np.clip(self.particles[:, 1], 0, self.H, out=self.particles[:, 1])
+
+    # Eq. 9: Measurement Update
+    def update(self, measured_pos, correlation_score):
+        # [NGƯỠNG BÀI BÁO] Chỉ cập nhật nếu độ tin cậy rất cao (> 0.65)
+        if correlation_score < 0.65: 
+            return 
+
+        dist = np.linalg.norm(self.particles - measured_pos, axis=1)
         
-        for d_obj in drone_objs:
-            best_alpha = 0
-            final_offset = None
-            
-            candidates = [m for m in map_objs if abs(d_obj.S - m.S)/(m.S+1e-5) < 0.5]
-            
-            for m_obj in candidates:
-                offset = self.find_best_alignment_hill_climbing(d_obj.region, m_obj.region)
-                aligned_poly = translate(d_obj.region, xoff=offset[0], yoff=offset[1])
-                alpha = self.calculate_alpha(aligned_poly, m_obj.region)
-                
-                if alpha > best_alpha:
-                    best_alpha = alpha
-                    final_offset = offset
-            
-            if best_alpha > 0.6 and final_offset is not None:
-                observations.append(GaussianObservation(final_offset, best_alpha))
+        # Eq. 5 & 6: Variance tỷ lệ nghịch với correlation
+        R = 50.0 * (1.0 - correlation_score) 
+        if R < 5.0: R = 5.0 
 
-        return observations
-
-# ==============================================================================
-# PHẦN 4: PARTICLE FILTER (GIỮ NGUYÊN)
-# ==============================================================================
-
-class GMMParticleFilter:
-    def __init__(self, num_particles=1000, map_bounds=(0, 1000, 0, 1000)):
-        self.N = num_particles
-        self.bounds = map_bounds
-        self.particles = [] 
-        self.is_initialized = False 
-
-    def initialize_from_observation(self, observations):
-        if not observations: return False
-        best_obs = max(observations, key=lambda o: o.score)
-        center = best_obs.mean
-        sigma = np.sqrt(best_obs.sigma_val) * 2.0
+        likelihood = np.exp(- (dist**2) / (2 * R**2))
         
-        self.particles = []
-        for _ in range(self.N):
-            pos = np.random.normal(center, sigma)
-            pos[0] = np.clip(pos[0], self.bounds[0], self.bounds[1])
-            pos[1] = np.clip(pos[1], self.bounds[2], self.bounds[3])
-            self.particles.append(Particle(pos, 1.0/self.N))
-            
-        self.is_initialized = True
-        return True
+        self.weights *= likelihood
+        self.weights += 1.e-300
+        self.weights /= np.sum(self.weights)
 
-    def predict(self, move_vector, noise_std=2.0):
-        if not self.is_initialized: return
-        move = np.array(move_vector)
-        noise = np.random.normal(0, noise_std, (self.N, 2))
-        for i, p in enumerate(self.particles):
-            p.mu += move + noise[i]
-            p.mu[0] = np.clip(p.mu[0], self.bounds[0], self.bounds[1])
-            p.mu[1] = np.clip(p.mu[1], self.bounds[2], self.bounds[3])
-
-    def update(self, observations):
-        if not self.is_initialized or not observations: return
-        
-        p_pos = np.array([p.mu for p in self.particles])
-        obs_means = np.array([o.mean for o in observations])
-        obs_vars = np.array([o.sigma_val for o in observations])
-        obs_scores = np.array([o.score for o in observations])
-        
-        if np.sum(obs_scores) == 0: return
-        obs_mix_w = obs_scores / np.sum(obs_scores) 
-
-        diff = p_pos[:, None, :] - obs_means[None, :, :]
-        dist_sq = np.sum(diff**2, axis=2) / obs_vars[None, :]
-        norm_const = 1.0 / (2 * np.pi * obs_vars)
-        p_components = obs_mix_w[None, :] * norm_const[None, :] * np.exp(-0.5 * dist_sq)
-        total_likelihood = np.sum(p_components, axis=1)
-
-        current_weights = np.array([p.w for p in self.particles])
-        new_weights = current_weights * (total_likelihood + 1e-300)
-        
-        w_sum = np.sum(new_weights)
-        if w_sum > 0: new_weights /= w_sum
-        else: new_weights[:] = 1.0 / self.N
-
-        min_dist_sq = np.min(dist_sq, axis=1)
-        is_matched = min_dist_sq < 9.0
-
-        for i, p in enumerate(self.particles):
-            p.w = new_weights[i]
-            if is_matched[i]:
-                p.c += 1.0 
-                p.w *= (1.0 + 0.1 * p.c)
-            else:
-                p.c = max(0.0, p.c - 0.5)
-
-        final_sum = sum(p.w for p in self.particles)
-        if final_sum > 0:
-            for p in self.particles: p.w /= final_sum
-
+    # Eq. 10: Resampling (Chuẩn, không Injection)
     def resample(self):
-        if not self.is_initialized: return
-        weights = np.array([p.w for p in self.particles])
-        n_eff = 1.0 / (np.sum(weights**2) + 1e-10)
-        
-        if n_eff < self.N / 2:
-            indices = np.random.choice(range(self.N), size=self.N, p=weights)
-            new_particles = []
-            for i in indices:
-                old = self.particles[i]
-                jitter = np.random.normal(0, 0.5, 2)
-                new_pos = old.mu + jitter
-                new_p = Particle(new_pos, 1.0/self.N)
-                new_p.c = old.c
-                new_particles.append(new_p)
-            self.particles = new_particles
+        n_eff = 1.0 / np.sum(self.weights**2)
+        if n_eff < self.N * 0.5:
+            indices = np.random.choice(self.N, self.N, p=self.weights)
+            self.particles = self.particles[indices]
+            self.weights.fill(1.0 / self.N)
+            self.particles += np.random.normal(0, 1.5, (self.N, 2))
 
+    # Eq. 11: Credibility
     def estimate(self):
-        if not self.is_initialized: return np.zeros(2)
-        x = sum(p.mu[0] * p.w for p in self.particles)
-        y = sum(p.mu[1] * p.w for p in self.particles)
-        return np.array([x, y])
+        mean_pos = np.average(self.particles, weights=self.weights, axis=0)
+        cov = np.cov(self.particles.T, aweights=self.weights)
+        det_cov = np.linalg.det(cov)
+        is_credible = det_cov < 2500 
+        return mean_pos, is_credible, det_cov
 
 # ==============================================================================
-# PHẦN 5: CHƯƠNG TRÌNH CHÍNH
+# 2. CLASS CFBVM MATCHER (NÂNG CẤP CHUẨN PAPER EQ.1 - 24 CHIỀU)
 # ==============================================================================
+class CFBVMMatcher:
+    def __init__(self, map_polys):
+        self.map_data = [] 
+        self.RADIUS_LEVELS = [30, 60, 90] 
+        self.NUM_SECTORS = 8  # NÂNG CẤP: Chia thành 8 hướng (mỗi hướng 45 độ)
+        
+        print(f"Đang tiền xử lý Vectơ Hình Dạng (24 chiều) cho {len(map_polys)} tòa nhà...")
+        
+        # Tối ưu hóa: Pre-compute các sector mask tại gốc (0,0)
+        self.sector_masks = self._precompute_sector_masks()
 
-def create_synthetic_data():
-    W, H = 800, 600
-    map_img = np.zeros((H, W), dtype=np.uint8)
-    cv2.rectangle(map_img, (200, 200), (300, 300), 255, -1) 
-    cv2.circle(map_img, (600, 400), 60, 255, -1)
-    pts = np.array([[400, 100], [450, 200], [350, 200]], np.int32)
-    cv2.fillPoly(map_img, [pts], 255)
-    return map_img
+        for poly in map_polys:
+            vec = self.compute_shape_vector(poly)
+            # Chỉ thêm vào DB nếu vector có dữ liệu
+            if np.sum(vec) > 0:
+                self.map_data.append({
+                    'poly': poly,
+                    'vector': vec,
+                    'centroid': (poly.centroid.x, poly.centroid.y),
+                    'area': poly.area
+                })
+
+    def _precompute_sector_masks(self):
+        """Tạo trước các mask hình rẻ quạt để không phải tính lại mỗi lần gọi hàm"""
+        masks = []
+        angle_step = 360.0 / self.NUM_SECTORS
+        prev_r = 0.0
+        
+        for r in self.RADIUS_LEVELS:
+            level_masks = []
+            for j in range(self.NUM_SECTORS):
+                start_angle = j * angle_step
+                end_angle = (j + 1) * angle_step
+                poly_mask = self._create_sector_poly(0, 0, prev_r, r, start_angle, end_angle)
+                level_masks.append(poly_mask)
+            masks.append(level_masks)
+            prev_r = r
+        return masks
+
+    def _create_sector_poly(self, cx, cy, r_in, r_out, start_deg, end_deg):
+        """Hàm hỗ trợ tạo polygon hình rẻ quạt"""
+        res = 10 
+        a1 = math.radians(start_deg)
+        a2 = math.radians(end_deg)
+        points = []
+        # Cung ngoài
+        angles = np.linspace(a1, a2, res)
+        for a in angles:
+            points.append((cx + r_out * math.cos(a), cy + r_out * math.sin(a)))
+        # Cung trong
+        if r_in > 0:
+            for a in reversed(angles):
+                points.append((cx + r_in * math.cos(a), cy + r_in * math.sin(a)))
+        else:
+            points.append((cx, cy))
+        return Polygon(points)
+
+    # Eq. 1: Building Shape Vector (Nâng cấp Logic)
+    def compute_shape_vector(self, poly):
+        cx, cy = poly.centroid.x, poly.centroid.y
+        vector = []
+        
+        # Dịch chuyển polygon về gốc tọa độ để khớp với mask đã pre-compute
+        # Cách này nhanh hơn 10x so với việc tạo mask mới
+        poly_centered = translate(poly, -cx, -cy)
+        
+        for i in range(len(self.RADIUS_LEVELS)): # 3 Levels
+            for j in range(self.NUM_SECTORS):    # 8 Sectors
+                mask = self.sector_masks[i][j]
+                try:
+                    # Kiểm tra nhanh bounding box để tránh tính toán intersection nặng
+                    if not poly_centered.bounds[0] > mask.bounds[2] and \
+                       not poly_centered.bounds[2] < mask.bounds[0] and \
+                       not poly_centered.bounds[1] > mask.bounds[3] and \
+                       not poly_centered.bounds[3] < mask.bounds[1]:
+                        
+                        val = poly_centered.intersection(mask).area
+                    else:
+                        val = 0.0
+                except:
+                    val = 0.0
+                vector.append(val)
+        
+        vec_np = np.array(vector)
+        # Chuẩn hóa vector
+        total = np.sum(vec_np)
+        if total > 0: vec_np = vec_np / total
+        return vec_np
+
+    # Eq. 2: Coarse Distance
+    def coarse_distance(self, vec_a, vec_b):
+        return np.sum(np.abs(vec_a - vec_b))
+
+    # Eq. 4: Fine Correlation (Giữ nguyên)
+    def compute_correlation(self, poly_cam, poly_ref):
+        p1 = translate(poly_cam, -poly_cam.centroid.x, -poly_cam.centroid.y)
+        p2 = translate(poly_ref, -poly_ref.centroid.x, -poly_ref.centroid.y)
+        
+        best_alpha = 0.0
+        for ang in [-5, 0, 5]: 
+            p1_rot = rotate(p1, ang, origin=(0,0))
+            try:
+                inter_area = p1_rot.intersection(p2).area
+                if inter_area > 0:
+                    denom = math.sqrt(p1_rot.area * p2.area)
+                    alpha = inter_area / denom
+                    if alpha > best_alpha: best_alpha = alpha
+            except: pass
+        return best_alpha
+
+    def process(self, drone_poly, estimated_pos):
+        if drone_poly is None: return None, 0.0
+        
+        drone_vec = self.compute_shape_vector(drone_poly)
+        if np.sum(drone_vec) == 0: return None, 0.0
+
+        search_radius = 500.0 
+        
+        # --- Giai đoạn 1: COARSE MATCHING ---
+        candidates = []
+        for item in self.map_data:
+            dx = item['centroid'][0] - estimated_pos[0]
+            dy = item['centroid'][1] - estimated_pos[1]
+            if math.hypot(dx, dy) > search_radius: continue
+            
+            dist = self.coarse_distance(drone_vec, item['vector'])
+            
+            # [Adjusted Threshold] Với vector 24 chiều, ngưỡng 0.5 là an toàn
+            if dist < 0.5: 
+                candidates.append(item)
+
+        if not candidates: return None, 0.0
+
+        # --- Giai đoạn 2: FINE MATCHING ---
+        best_match_poly = None
+        best_score = 0.0
+        
+        for cand in candidates:
+            score = self.compute_correlation(drone_poly, cand['poly'])
+            if score > best_score:
+                best_score = score
+                best_match_poly = cand['poly']
+                
+        # [NGƯỠNG BÀI BÁO] Chấp nhận kết quả cuối cùng nếu độ khớp > 0.6
+        if best_match_poly and best_score > 0.6: 
+            vec_cam_to_bld = np.array([drone_poly.centroid.x - 200, drone_poly.centroid.y - 200])
+            map_centroid = np.array([best_match_poly.centroid.x, best_match_poly.centroid.y])
+            measured_pos = map_centroid - vec_cam_to_bld
+            return measured_pos, best_score
+            
+        return None, 0.0
+
+# ==============================================================================
+# 3. MÔI TRƯỜNG GIẢ LẬP & MAIN (GIỮ NGUYÊN CODE CỦA BẠN)
+# ==============================================================================
+def create_complex_map(W, H):
+    img = np.zeros((H, W), dtype=np.uint8)
+    np.random.seed(99) 
+    for _ in range(350):
+        x = np.random.randint(50, W-300)
+        y = np.random.randint(50, H-300)
+        w, h = np.random.randint(120, 200), np.random.randint(120, 200)
+        cv2.rectangle(img, (x, y), (x+w, y+h), 255, -1)
+        if np.random.rand() > 0.5:
+            cut_w, cut_h = int(w*0.6), int(h*0.6)
+            cv2.rectangle(img, (x+w-cut_w, y), (x+w, y+cut_h), 0, -1)
+    return img
 
 def main():
-    # Setup
-    map_img = create_synthetic_data()
+    W, H = 5000, 4000
+    print("Đang khởi tạo bản đồ phức tạp...")
+    map_img = create_complex_map(W, H)
     
-    # --- THAY ĐỔI: Dùng MaskProcessor ---
-    mask_processor = MaskProcessor()
+    _, thresh = cv2.threshold(map_img, 127, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    map_polys = []
+    for c in contours:
+        if cv2.contourArea(c) > 800:
+            p = Polygon(c.reshape(-1, 2))
+            if not p.is_valid: p = p.buffer(0)
+            map_polys.append(p)
+
+    # Tăng số lượng hạt để bù đắp cho việc threshold quá chặt
+    pf = PaperCompliantPF(N=3000, W=W, H=H)
+    matcher = CFBVMMatcher(map_polys) 
     
-    # Load Map Features (Coi map như một mask lớn)
-    map_objs = mask_processor.extract_features(map_img, "MAP")
+    # Khởi tạo class điều khiển từ file mapping của bạn
+    print("Đang kết nối Controller...")
+    controller = DroneController()
     
-    pf = GMMParticleFilter(num_particles=1000, map_bounds=(0, 800, 0, 600))
-    matcher = RobustMatchingSystem(drone_view_size=(150, 150))
+    # Khởi tạo vị trí ban đầu (Giả sử drone bắt đầu ở tọa độ 1000, 1000 trong map)
+    real_pos_sim = np.array([1000.0, 1000.0]) 
+    pf.init(real_pos_sim[0], real_pos_sim[1])
     
-    true_x, true_y = 100, 100
-    vx, vy = 3, 2             
-    
-    print(">>> SYSTEM STARTED WITH MASK PROCESSOR.")
-    print(">>> Simulating Detectron2 binary output...")
+    # Setup hiển thị
+    DISPLAY_SCALE = 0.15
+    h_d, w_d = int(H*DISPLAY_SCALE), int(W*DISPLAY_SCALE)
+    bg_static = cv2.resize(map_img, (w_d, h_d), interpolation=cv2.INTER_NEAREST)
+    bg_static = cv2.cvtColor(bg_static, cv2.COLOR_GRAY2BGR)
+
+    print("\n[READY] Dùng phím mũi tên để điều khiển. Nhấn 'c' để chụp ảnh.")
 
     while True:
-        # 1. Update Simulation
-        true_x += vx
-        true_y += vy
-        if true_x > 750 or true_x < 50: vx = -vx
-        if true_y > 550 or true_y < 50: vy = -vy
-        
-        # 2. Tạo 'Detectron Output' giả lập
-        # (Ở thực tế, bước này là bạn lấy mask từ model Detectron2 của bạn)
-        M = np.float32([[1, 0, -true_x], [0, 1, -true_y]])
-        
-        # Đây chính là biến mask mà code Detectron của bạn sẽ trả về
-        detectron_binary_output = cv2.warpAffine(map_img, M, (150, 150))
-        
-        # 3. Process Mask (Trực tiếp từ binary -> Polygon)
-        drone_objs = mask_processor.extract_features(detectron_binary_output, "DRONE")
-        
-        # 4. Matching & Filter (Workflow cũ)
-        observations = matcher.run(drone_objs, map_objs)
-        
-        est_pos = np.array([0, 0])
-        status_text = "WAITING..."
-        status_color = (0, 255, 255)
+        # ============================================================
+        # BƯỚC 1: LẤY INPUT TỪ CODE MAPPING
+        # ============================================================
+        # Hàm này thay thế hoàn toàn getKeyboardInput() cũ
+        # Nó trả về vận tốc (dx, dy) để sim dùng, và frame ảnh thật (nếu có)
 
-        if not pf.is_initialized:
-            if len(observations) > 0:
-                success = pf.initialize_from_observation(observations)
-                if success: status_text = "INITIALIZED!"
+        velocity, real_frame, path_points = controller.get_control_step()
+                
+        # Cập nhật vị trí Sim dựa trên điều khiển
+        real_pos_sim += velocity
+        
+        # Giới hạn biên map
+        real_pos_sim[0] = np.clip(real_pos_sim[0], 200, W-200)
+        real_pos_sim[1] = np.clip(real_pos_sim[1], 200, H-200)
+        
+        # ============================================================
+        # BƯỚC 2: CAMERA SIMULATION (Hoặc dùng Camera thật)
+        # ============================================================
+        # Nếu có drone thật kết nối, ta dùng ảnh thật để hiển thị PIP
+        # Nhưng để thuật toán chạy (Map Matching), ta vẫn cần view giả lập từ Map ảo
+        # vì thuật toán này so sánh view hiện tại với Database Map có sẵn.
+        
+        M = np.float32([[1, 0, -real_pos_sim[0] + 200], [0, 1, -real_pos_sim[1] + 200]])
+        sim_cam_view = cv2.warpAffine(map_img, M, (400, 400))
+        
+        # Tìm contour Drone từ Sim View
+        drone_poly = None
+        if len(sim_cam_view.shape)==3: gray = cv2.cvtColor(sim_cam_view, cv2.COLOR_BGR2GRAY)
+        else: gray = sim_cam_view
+        _, th = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+        cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            c = max(cnts, key=cv2.contourArea)
+            if cv2.contourArea(c) > 500:
+                approx = cv2.approxPolyDP(c, 0.01*cv2.arcLength(c,True), True)
+                if len(approx) >= 3:
+                    drone_poly = Polygon(approx.reshape(-1,2))
+                    if not drone_poly.is_valid: drone_poly = drone_poly.buffer(0)
+
+        # ============================================================
+        # BƯỚC 3: CHẠY THUẬT TOÁN (PARTICLE FILTER)
+        # ============================================================
+        
+        # 3.1: Propagate (Quan trọng: Dùng velocity từ Controller)
+        pf.propagate(velocity)
+        
+        pred_pos, _, _ = pf.estimate()
+        
+        # 3.2: Matching
+        measured_pos, score = matcher.process(drone_poly, pred_pos)
+        
+        # 3.3: Update & Resample
+        if measured_pos is not None:
+             jump = np.linalg.norm(measured_pos - pred_pos)
+             if jump < 200: # Ngưỡng chấp nhận
+                 pf.update(measured_pos, score)
+                 pf.resample()
+        
+        est_pos, is_credible, _ = pf.estimate()
+
+        # ============================================================
+        # BƯỚC 4: HIỂN THỊ
+        # ============================================================
+        vis = bg_static.copy()
+        def to_s(x,y): return int(x*DISPLAY_SCALE), int(y*DISPLAY_SCALE)
+        
+        # Vẽ Hạt (Xanh lá)
+        for p in pf.particles:
+            cv2.circle(vis, to_s(p[0], p[1]), 1, (0, 255, 0), -1)
+            
+        # Vẽ Drone Thực (Chấm đỏ / Khung Xanh)
+        rx, ry = to_s(real_pos_sim[0], real_pos_sim[1])
+        cv2.rectangle(vis, (rx-10, ry-10), (rx+10, ry+10), (255, 100, 0), 2)
+        
+        # Vẽ Drone Ước lượng (Chấm đỏ đậm)
+        ex, ey = to_s(est_pos[0], est_pos[1])
+        cv2.circle(vis, (ex, ey), 4, (0, 0, 255), -1 if is_credible else 2)
+        
+        # Vẽ đường nối
+        cv2.line(vis, (rx, ry), (ex, ey), (0, 255, 255), 1)
+
+        # HIỂN THỊ CAMERA
+        # Ưu tiên hiển thị Camera thật ở góc nếu có, nếu không thì hiển thị Sim View
+        if real_frame is not None:
+             # Resize camera thật
+             pip = cv2.resize(real_frame, (150, 150))
+             cv2.putText(vis, "REAL CAM", (15, h_d - 135), cv2.FONT_HERSHEY_PLAIN, 1, (0,255,0), 2)
         else:
-            status_text = "TRACKING"
-            status_color = (0, 0, 255)
-            pf.predict([vx, vy], noise_std=2.0)
-            if len(observations) > 0:
-                pf.update(observations)
-            pf.resample()
-            est_pos = pf.estimate()
-        
-        # 5. Visuals
-        vis_img = cv2.cvtColor(map_img, cv2.COLOR_GRAY2BGR)
-        if pf.is_initialized:
-            for p in pf.particles:
-                cv2.circle(vis_img, (int(p.mu[0]), int(p.mu[1])), 1, (0, 255, 0), -1)
-            cv2.circle(vis_img, (int(est_pos[0]), int(est_pos[1])), 8, (0, 0, 255), -1)
+             # Dùng Sim View
+             pip = cv2.cvtColor(cv2.resize(sim_cam_view, (150, 150)), cv2.COLOR_GRAY2BGR)
+             cv2.putText(vis, "SIM CAM", (15, h_d - 135), cv2.FONT_HERSHEY_PLAIN, 1, (255,255,255), 2)
+             
+        vis[h_d-160 : h_d-10, 10 : 160] = pip
+        cv2.rectangle(vis, (10, h_d-160), (160, h_d-10), (0, 255, 255), 2)
 
-        cv2.rectangle(vis_img, (int(true_x)-10, int(true_y)-10), 
-                      (int(true_x)+10, int(true_y)+10), (255, 0, 0), 2)
+        # Hiển thị thông số
+        h_drone = controller.get_drone_height()
+        cv2.putText(vis, f"Control: KEYMODULE | Height: {h_drone}cm", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1)
         
-        cv2.putText(vis_img, f"Mode: {status_text}", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+        cv2.imshow("Integrated Simulation", vis)
         
-        cv2.imshow("Map", vis_img)
-        cv2.imshow("Detectron Mask Input", detectron_binary_output)
-        
-        if cv2.waitKey(30) & 0xFF == ord('q'):
+        # Xử lý thoát
+        if cv2.waitKey(1) == 27: # ESC
+            if controller.has_drone: controller.drone.land()
             break
-
+            
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
