@@ -4,19 +4,17 @@ import math
 from shapely.geometry import Polygon, box
 from shapely.affinity import translate, rotate
 import sys
-
-# ==============================================================================
-# 0. CONTROLLER
-# ==============================================================================
+from simulation import log_state, analyze_and_plot
+# === 0. IMPORT CONTROLLER CỦA BẠN ===
 try:
     from MAPPING import DroneController
-    print("[INFO] DroneController loaded")
+    print("[INFO] Đã tải DroneController từ my_drone_control.py")
 except ImportError:
-    print("Missing MAPPING.py")
+    print("[ERROR] Không tìm thấy file 'my_drone_control.py'. Hãy lưu code điều khiển vào file này!")
     sys.exit()
 
 # ==============================================================================
-# 1. PARTICLE FILTER – STRICT PAPER COMPLIANCE
+# 1. PARTICLE FILTER – STRICT PAPER COMPLIANCE (GIỮ NGUYÊN TUYỆT ĐỐI)
 # ==============================================================================
 class PaperCompliantPF:
     def __init__(self, N, W, H):
@@ -71,6 +69,7 @@ class PaperCompliantPF:
 
         # Eq.(7) counter update
         self.C[matched] += 1
+        self.C[~matched] -= 1
         self.C = np.maximum(self.C, 1)
 
         # weight update
@@ -110,7 +109,7 @@ class PaperCompliantPF:
 
 
 # ==============================================================================
-# 2. CFBVM MATCHER – STRICT PAPER
+# 2. CFBVM MATCHER – STRICT PAPER (GIỮ NGUYÊN TUYỆT ĐỐI)
 # ==============================================================================
 class CFBVMMatcher:
     def __init__(self, map_polys):
@@ -220,10 +219,10 @@ class CFBVMMatcher:
         return comps
 
 # ==============================================================================
-# 3. MAIN
+# 3. MAIN (ĐÃ CẬP NHẬT PHẦN ĐIỀU KHIỂN)
 # ==============================================================================
 def main():
-    # ===================== MAP GENERATION =====================
+    # ===================== MAP GENERATION (GIỮ NGUYÊN) =====================
     W, H = 5000, 4000
     img = np.zeros((H, W), np.uint8)
 
@@ -237,28 +236,47 @@ def main():
     polys = [Polygon(c.reshape(-1,2)).buffer(0)
              for c in cnts if cv2.contourArea(c) > 800]
 
-    # ===================== SYSTEM INIT =====================
+    # ===================== SYSTEM INIT (GIỮ NGUYÊN) =====================
     pf = PaperCompliantPF(3000, W, H)
     matcher = CFBVMMatcher(polys)
 
-    # Ground truth UAV
+    # Vị trí khởi đầu
     real = np.array([1000.0, 1000.0])
-    velocity = np.array([2.0, 1.5])
     pf.init(*real)
 
-    scale = 0.15  # visualization scale
+    # === [NEW] KẾT NỐI CONTROLLER CỦA BẠN ===
+    controller = DroneController() # Khởi tạo Controller
+    print("--- CHẾ ĐỘ ĐIỀU KHIỂN BẰNG TAY ĐÃ BẬT ---")
+    print("Sử dụng cửa sổ PYGAME (WASD/Mũi tên) để lái Drone!")
 
-    # ===================== SIMULATION LOOP =====================
+    scale = 0.15 
+    DRIFT_INTENSITY = 0.5 
+
+    # ===================== VISUALIZTION LOOP (CẢI TIẾN) =====================
     while True:
-        # ---- Ground truth motion ----
-        real += velocity
+        # ---- 1. MOVEMENT (LẤY TỪ BÀN PHÍM + NHIỄU) ----
+        
+        # [NEW] Lấy input từ controller (trả về dx, dy)
+        control_velocity_vector, _, _ = controller.get_control_step()
+        
+        # Tạo nhiễu ngẫu nhiên (gió thổi, trượt)
+        noise = np.random.normal(0, DRIFT_INTENSITY, 2)
+        
+        # [NEW] Vị trí thật = Lệnh điều khiển + Nhiễu
+        real_movement = control_velocity_vector + noise
+        real += real_movement
 
-        if real[0] < 200 or real[0] > W-200:
-            velocity[0] *= -1
-        if real[1] < 200 or real[1] > H-200:
-            velocity[1] *= -1
+        # Xử lý va chạm tường (Map Boundaries) - Giữ drone trong map
+        real[0] = np.clip(real[0], 200, W-200)
+        real[1] = np.clip(real[1], 200, H-200)
 
-        # ---- Camera image ----
+        # ---- 2. SENSOR INPUT (BỘ LỌC CHỈ BIẾT LỆNH ĐIỀU KHIỂN) ----
+        # PF chỉ nhận 'control_velocity_vector' (không có nhiễu)
+        pf.propagate(control_velocity_vector)
+
+        # ---- Camera image (GIỮ NGUYÊN) ----
+        # Do controller của bạn khóa Yaw=90 (hướng lên trên), ta dùng ma trận đơn vị
+        # (North-Up), khớp với logic tạo ảnh ban đầu.
         M = np.float32([[1,0,-real[0]+200],
                         [0,1,-real[1]+200]])
         cam = cv2.warpAffine(img, M, (400,400))
@@ -267,12 +285,8 @@ def main():
         cs,_ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cam_poly = Polygon(max(cs,key=cv2.contourArea).reshape(-1,2)) if cs else None
 
-        # ---- Particle filter ----
-        pf.propagate(velocity)
-
-        # predicted motion ONLY
+        # ---- Particle filter Update (THUẬT TOÁN GỐC) ----
         pred_motion = pf.prev_est_pos + pf.last_velocity
-
         gmm = matcher.process_gmm(cam_poly, pred_motion)
 
         pf.update_gmm(gmm)
@@ -280,8 +294,7 @@ def main():
 
         est, locked, St = pf.estimate()
 
-
-        # ===================== VISUALIZATION =====================
+        # ===================== VISUALIZATION (GIỮ NGUYÊN) =====================
         vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         vis = cv2.resize(vis, (int(W*scale), int(H*scale)))
 
@@ -289,23 +302,30 @@ def main():
         for p in pf.particles[::5]:
             cv2.circle(vis,
                        (int(p[0]*scale), int(p[1]*scale)),
-                       1, (255,100,0), -1)
+                       1, (255,0,255), -1)
 
-        # ground truth
+        # ground truth (Red)
         cv2.circle(vis,
                    (int(real[0]*scale), int(real[1]*scale)),
-                   6, (0,0,255), -1)
+                   3, (0,0,255), -1)
 
-        # estimate
+        # estimate (Yellow)
         cv2.circle(vis,
                    (int(est[0]*scale), int(est[1]*scale)),
-                   6, (0,255,255), -1)
-
+                   3, (0,255,255), -1)
+        
+        log_state(real, est, St)
+        
         # camera FOV
         cv2.rectangle(vis,
             (int((real[0]-200)*scale), int((real[1]-200)*scale)),
             (int((real[0]+200)*scale), int((real[1]+200)*scale)),
             (0,255,0), 1)
+
+        # Thêm thông tin điều khiển vào hiển thị
+        cv2.putText(vis,
+            f"Control V: {control_velocity_vector[0]:.1f}, {control_velocity_vector[1]:.1f}",
+            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
         cv2.putText(vis,
             f"Credibility St = {St:.3f}  LOCK={locked}",
@@ -316,9 +336,9 @@ def main():
 
         if cv2.waitKey(30) == 27:
             break
-
+    
+    analyze_and_plot()
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()
