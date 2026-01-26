@@ -201,7 +201,6 @@ class CFBVMMatcher:
 # =============================== MAIN ==========================================
 # ==============================================================================
 def main():
-    # ---- LOAD REF MAP ----
     ref = cv2.imread(REF_MAP_PATH, 0)
     _, ref = cv2.threshold(ref, 127, 255, cv2.THRESH_BINARY)
     H, W = ref.shape
@@ -214,39 +213,40 @@ def main():
             if not p.is_valid: p = p.buffer(0)
             map_polys.append(p)
 
-    # ---- LOAD CAM ----
     cam = cv2.imread(CAM_PATH, 0)
     _, cam = cv2.threshold(cam, 127, 255, cv2.THRESH_BINARY)
     cs,_ = cv2.findContours(cam, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    cam_poly = None
-    if cs:
-        cam_poly = Polygon(max(cs, key=cv2.contourArea).reshape(-1,2))
+    cam_poly = Polygon(max(cs, key=cv2.contourArea).reshape(-1,2)) if cs else None
 
-    # ---- INIT ----
     matcher = CFBVMMatcher(map_polys)
     pf = PaperCompliantPF(3000, W, H)
     pf.init(W//2, H//2)
 
-    # ---- RUN ----
+    last_gmm = []
+
     for _ in range(10):
         pf.propagate()
         est,_,_ = pf.estimate_and_evaluate()
-        gmm = matcher.process(cam_poly, est)
-        pf.update_with_gmm(gmm)
+        last_gmm = matcher.process(cam_poly, est)
+        pf.update_with_gmm(last_gmm)
         pf.resample()
 
-    # ---- VIS ----
     vis = cv2.cvtColor(ref, cv2.COLOR_GRAY2BGR)
+
     for p in pf.particles:
         cv2.circle(vis, (int(p[0]), int(p[1])), 1, (0,255,0), -1)
+
+    for comp in last_gmm:
+        mu = comp['mu']
+        cv2.circle(vis, (int(mu[0]), int(mu[1])), 6, (255,0,0), 2)
 
     est,cred,score = pf.estimate_and_evaluate()
     cv2.circle(vis, (int(est[0]), int(est[1])), 8, (0,0,255), -1)
     cv2.putText(vis, f"S={score}", (20,30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
 
-    cv2.imshow("REF MAP + PF RESULT", vis)
-    cv2.imshow("CAM", cam)
+    cv2.imshow("REF MAP + PF + GMM MATCH", vis)
+    cv2.imshow("CAM BINARY", cam)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
