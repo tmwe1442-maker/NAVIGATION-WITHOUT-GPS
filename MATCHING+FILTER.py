@@ -218,7 +218,8 @@ class CFBVMMatcher:
                 self.map_data.append({
                     'poly': simple_poly,
                     'vector': vec,
-                    'centroid': (simple_poly.centroid.x, simple_poly.centroid.y)
+                    'centroid': (simple_poly.centroid.x, simple_poly.centroid.y),
+                    'area': simple_poly.area
                 })
 
     def _precompute_sector_masks(self):
@@ -276,55 +277,49 @@ class CFBVMMatcher:
     # ==========================================================================
     # PHẦN QUAN TRỌNG NHẤT: CÔNG THỨC (4) ĐÚNG CHUẨN
     # ==========================================================================
-    def compute_correlation(self, cam_poly, ref_poly):
+    def compute_correlation(self, cam_poly, ref_poly, img_w=400, img_h=400):
         """
-        Tính hệ số tương quan Alpha theo đúng Eq. 4.
-        alpha = Intersection(Vcam, Vref) / Sqrt(Intersection(Vbox, Vref) * Intersection(Vbox, Vcam))
+        SỬA LỖI: V_box phải là khung hình Camera (Field of View), 
+        không phải bounding box của tòa nhà.
         """
-        # 1. Xác định V_box (Khung bao của Camera)
-        v_box = cam_poly.envelope
+        # 1. Tạo V_box là hình chữ nhật kích thước ảnh, tâm trùng tâm tòa nhà
+        cx, cy = cam_poly.centroid.x, cam_poly.centroid.y
+        v_box = box(cx - img_w/2, cy - img_h/2, cx + img_w/2, cy + img_h/2)
         
-        # 2. Dịch chuyển về gốc tọa độ (0,0) để xoay
-        c_cam = cam_poly.centroid
+        # 2. Dịch chuyển về gốc (0,0)
         c_ref = ref_poly.centroid
         
-        # V_cam và V_box phải dịch chuyển cùng nhau
-        p_cam_centered = translate(cam_poly, -c_cam.x, -c_cam.y)
-        p_box_centered = translate(v_box, -c_cam.x, -c_cam.y)
+        # Ref đứng yên tại (0,0)
         p_ref_centered = translate(ref_poly, -c_ref.x, -c_ref.y)
+        
+        # Cam và Box di chuyển tương đối
+        # Lưu ý: Trong thực tế ta xoay Cam đè lên Ref.
+        p_cam_centered = translate(cam_poly, -cx, -cy)
+        p_box_centered = translate(v_box, -cx, -cy)
 
         best_alpha = 0.0
         best_angle = 0.0
         
-        # Pre-compute mẫu số phần Cam (Term 2)
-        # Term 2: intersection(V_box, V_cam) -> Chính là diện tích V_cam
-        term2_denom = p_box_centered.intersection(p_cam_centered).area
+        # Tối ưu: Tính trước diện tích Box giao Cam (Thường là diện tích Cam nếu Cam nằm trọn trong ảnh)
+        # Tuy nhiên cứ tính intersection cho chắc chắn
+        term2 = p_box_centered.intersection(p_cam_centered).area 
+        if term2 == 0: return 0.0, 0.0
 
-        # 3. Quét góc xoay (Fine Matching)
-        # Quét 360 độ nếu chưa biết hướng.
+        # 3. Quét góc
         for ang in np.arange(-180, 180, 5): 
-            
-            # Xoay V_cam và V_box (V_ref giữ nguyên)
+            # Xoay cả Khung nhìn (Box) và Tòa nhà (Cam)
             r_cam = rotate(p_cam_centered, ang, origin=(0,0))
             r_box = rotate(p_box_centered, ang, origin=(0,0))
             
-            # --- TỬ SỐ (NUMERATOR) ---
-            # intersection(V_cam, V_ref)
             inter_cam_ref = r_cam.intersection(p_ref_centered).area
             
             if inter_cam_ref > 0:
-                # --- MẪU SỐ (DENOMINATOR) - EQ. 4 ---
+                # Term 1: Bản đồ Ref giao với Khung nhìn Box
+                term1 = r_box.intersection(p_ref_centered).area
                 
-                # Term 1: intersection(V_box, V_ref)
-                # Phần Reference lọt vào trong khung Box đang xoay
-                term1_denom = r_box.intersection(p_ref_centered).area
-                
-                # Mẫu số = sqrt( Term1 * Term2 )
-                denom = math.sqrt(term1_denom * term2_denom)
-                
+                denom = math.sqrt(term1 * term2)
                 if denom > 0:
                     alpha = inter_cam_ref / denom
-                    
                     if alpha > best_alpha:
                         best_alpha = alpha
                         best_angle = ang
@@ -349,6 +344,11 @@ class CFBVMMatcher:
                 dist = np.linalg.norm(np.array(item['centroid']) - est_pos)
                 if dist > search_radius:
                     continue
+
+            # Kiểm tra tồn tại key 'area' trước khi dùng
+            if 'area' in item:
+                ratio = cam_poly.area / (item['area'] + 1e-5)
+                if ratio < 0.3 or ratio > 3.0: continue
 
             # Lọc thô bằng Shape Context
             if self.coarse_distance(cam_vec, item['vector']) > 0.35: 
@@ -398,7 +398,11 @@ def main():
     mask_input = cv2.imread(MASK_PATH, 0)
     if mask_input is None: return print("Lỗi Input Mask! Kiểm tra đường dẫn.")
     
-    proc_frame = cv2.resize(mask_input, (400, 400))
+    scale_down_factor = 0.15 
+    h_in, w_in = mask_input.shape
+    mask_input = cv2.resize(mask_input, (int(w_in * scale_down_factor), int(h_in * scale_down_factor)))     
+
+    proc_frame = mask_input
     _, proc_frame = cv2.threshold(proc_frame, 127, 255, cv2.THRESH_BINARY)
     
     raw_cam_polys = get_clean_polygons(proc_frame, min_area=100)
@@ -418,9 +422,12 @@ def main():
     if len(visible_polys) > 0:
         target = visible_polys[0] 
         for item in matcher.map_data:
+            # Kiểm tra key area
+            if 'area' not in item: continue
+
             ratio = target.area / (item['area'] + 1e-5)
             if 0.8 < ratio < 1.2:
-                score = matcher.compute_correlation(target, item['poly'])
+                score, _ = matcher.compute_correlation(target, item['poly'])
                 if score > max_score:
                     max_score = score
                     best_pos = item['centroid']
@@ -446,7 +453,8 @@ def main():
         all_matches = [] 
         for i, d_poly in enumerate(visible_polys): 
             # Tìm kiếm cục bộ quanh vị trí ước lượng
-            matches = matcher.process(d_poly, est_pos, search_radius=400) 
+            # [SỬA LỖI Ở ĐÂY]: Thêm tham số (200, 200) là tâm ảnh camera
+            matches = matcher.process(d_poly, (200, 200), est_pos, search_radius=400) 
             all_matches.extend(matches) 
         
         # 4. Update Particle Weights (Measurement update)
