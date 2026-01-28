@@ -473,9 +473,9 @@ def main():
         for p in pf.particles: 
             cv2.circle(vis, (int(p[0]), int(p[1])), 2, (255, 165, 0), -1) 
         
-        # Vẽ Vị trí ước lượng (Màu đỏ)
+        # Vẽ Vị trí ước lượng (Màu tím)
         # Nếu S_t < 0 (Không tin cậy) -> Vẽ màu vàng
-        color = (0, 0, 255) if S_t > 0 else (0, 255, 255)
+        color = (255, 0, 255) if S_t > 0 else (0, 255, 255)
         status_text = "RELIABLE" if S_t > 0 else "UNSTABLE"
         
         cv2.circle(vis, (int(final_pos[0]), int(final_pos[1])), 10, color, -1) 
