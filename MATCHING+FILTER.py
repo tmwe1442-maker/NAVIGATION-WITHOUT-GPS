@@ -198,164 +198,181 @@ class PaperCompliantPF:
 # ============================================================================== 
 # 3. CLASS CFBVM MATCHER (Implementing Eqs 1, 2, 3, 4)
 # ============================================================================== 
-class CFBVMMatcher: 
-    def __init__(self, map_polys): 
-        self.map_data = [] 
-        # [GIỮ NGUYÊN] Radius levels chuẩn theo bài báo
+class CFBVMMatcher:
+    """
+    Class xử lý so khớp bản đồ theo hình học (Contour-based Matching).
+    """
+    def __init__(self, map_polys):
+        self.map_data = []
+        # Cấu hình Shape Context (Eq. 1, 2)
         self.RADIUS_LEVELS = [20, 40, 60] 
-        self.NUM_SECTORS = 8 
-        self.sector_masks = self._precompute_sector_masks() 
-        self.norm_factor = np.pi * (self.RADIUS_LEVELS[-1]**2)
+        self.NUM_SECTORS = 8
+        self.sector_masks = self._precompute_sector_masks()
+        self.norm_factor = np.pi * (self.RADIUS_LEVELS[-1]**2) 
 
-        for poly in map_polys: 
+        # Tiền xử lý bản đồ tham chiếu
+        for poly in map_polys:
             simple_poly = poly.simplify(0.5, preserve_topology=True)
-            vec = self.compute_shape_vector(simple_poly) 
-            if np.sum(vec) > 0: 
-                self.map_data.append({ 
-                    'poly': simple_poly, 
-                    'vector': vec, 
-                    'centroid': (simple_poly.centroid.x, simple_poly.centroid.y), 
-                    'area': poly.area
-                }) 
+            vec = self.compute_shape_vector(simple_poly)
+            if np.sum(vec) > 0:
+                self.map_data.append({
+                    'poly': simple_poly,
+                    'vector': vec,
+                    'centroid': (simple_poly.centroid.x, simple_poly.centroid.y)
+                })
 
-    # ... (Các hàm _precompute_sector_masks, compute_shape_vector, coarse_distance GIỮ NGUYÊN) ...
     def _precompute_sector_masks(self):
-        # ... (Code cũ) ...
-        masks = [] 
-        angle_step = 360.0 / self.NUM_SECTORS 
-        prev_r = 0.0 
-        for r in self.RADIUS_LEVELS: 
-            level_masks = [] 
-            for j in range(self.NUM_SECTORS): 
-                pts = [(0,0)]
-                for a in np.linspace(j*angle_step, (j+1)*angle_step, 10):
-                    rad = math.radians(a)
-                    pts.append((r*math.cos(rad), r*math.sin(rad)))
-                if prev_r > 0:
-                     for a in reversed(np.linspace(j*angle_step, (j+1)*angle_step, 10)):
-                        rad = math.radians(a)
-                        pts.append((prev_r*math.cos(rad), prev_r*math.sin(rad)))
-                level_masks.append(Polygon(pts))
-            masks.append(level_masks) 
-            prev_r = r 
-        return masks 
+        masks = []
+        angle_step = 360.0 / self.NUM_SECTORS
+        prev_r = 0.0
+        for r in self.RADIUS_LEVELS:
+            level = []
+            for j in range(self.NUM_SECTORS):
+                a1 = j * angle_step
+                a2 = (j + 1) * angle_step
+                level.append(self._sector(prev_r, r, a1, a2))
+            masks.append(level)
+            prev_r = r
+        return masks
+
+    def _sector(self, r1, r2, a1, a2):
+        pts = []
+        # Vẽ cung tròn chi tiết
+        for a in np.linspace(math.radians(a1), math.radians(a2), 15):
+            pts.append((r2*np.cos(a), r2*np.sin(a)))
+        if r1 > 0:
+            for a in reversed(np.linspace(math.radians(a1), math.radians(a2), 15)):
+                pts.append((r1*np.cos(a), r1*np.sin(a)))
+        else:
+            pts.append((0,0))
+        return Polygon(pts)
 
     def compute_shape_vector(self, poly):
-        # ... (Code cũ) ...
+        """Tính descriptor hình học (Eq. 2)"""
         cx, cy = poly.centroid.xy
-        vector = [] 
-        poly_centered = translate(poly, -cx, -cy) 
-        for i in range(len(self.RADIUS_LEVELS)): 
-            for j in range(self.NUM_SECTORS): 
-                try: 
-                    if poly_centered.intersects(self.sector_masks[i][j]):
-                        val = poly_centered.intersection(self.sector_masks[i][j]).area 
-                    else: val = 0.0
-                except: val = 0.0 
-                vector.append(val) 
-        vec_np = np.array(vector) 
-        total = np.sum(vec_np) 
-        if total > 0: vec_np = vec_np / total 
-        return vec_np
+        p = translate(poly, -cx[0], -cy[0])
+        vec = []
+        for i in range(3):
+            for j in range(8):
+                inter = p.intersection(self.sector_masks[i][j])
+                vec.append(inter.area if not inter.is_empty else 0)
+        v = np.array(vec)
+        return v / self.norm_factor
 
     def coarse_distance(self, vec_a, vec_b):
-        return np.sum(np.abs(vec_a - vec_b))
+        """So khớp thô (Coarse Matching) - Eq. 3"""
+        mat_a = vec_a.reshape(3, 8)
+        mat_b = vec_b.reshape(3, 8)
+        min_dist = float('inf')
+        
+        # Rotation invariant cho vector
+        for shift in range(8):
+            b_shifted = np.roll(mat_b, shift, axis=1)
+            dist = np.sum(np.abs(mat_a - b_shifted))
+            if dist < min_dist:
+                min_dist = dist
+        return min_dist
 
     # ==========================================================================
-    # [FIX] ĐÂY LÀ PHẦN SỬA LẠI CHO ĐÚNG EQ. 4
+    # PHẦN QUAN TRỌNG NHẤT: CÔNG THỨC (4) ĐÚNG CHUẨN
     # ==========================================================================
-    def compute_correlation(self, poly_cam, poly_ref): 
+    def compute_correlation(self, cam_poly, ref_poly):
         """
-        Thực hiện Eq. 4: Fine matching model
-        alpha = intersection(V_cam, V_ref) / sqrt( intersection(V_box, V_ref) * intersection(V_box, V_cam) )
+        Tính hệ số tương quan Alpha theo đúng Eq. 4.
+        alpha = Intersection(Vcam, Vref) / Sqrt(Intersection(Vbox, Vref) * Intersection(Vbox, Vcam))
         """
-        # Đưa về cùng hệ tọa độ tâm (0,0) để so sánh hình dáng
-        p1 = translate(poly_cam, -poly_cam.centroid.x, -poly_cam.centroid.y) # V_cam
-        p2 = translate(poly_ref, -poly_ref.centroid.x, -poly_ref.centroid.y) # V_ref
+        # 1. Xác định V_box (Khung bao của Camera)
+        v_box = cam_poly.envelope
         
-        best_alpha = 0.0 
+        # 2. Dịch chuyển về gốc tọa độ (0,0) để xoay
+        c_cam = cam_poly.centroid
+        c_ref = ref_poly.centroid
         
-        # Thử xoay mỗi 15 độ
-        for ang in range(0, 360, 15): 
-            p1_rot = rotate(p1, ang, origin=(0,0)) 
-            
-            # --- TẠO V_BOX (QUAN TRỌNG) ---
-            # V_box là khung hình bao quanh V_cam.
-            # Trong không gian local (tại tâm 0,0), V_box chính là bounding box của p1_rot
-            minx, miny, maxx, maxy = p1_rot.bounds
-            v_box = box(minx, miny, maxx, maxy) 
-            
-            try: 
-                # 1. Tử số: intersection(V_cam, V_ref)
-                inter_cam_ref = p1_rot.intersection(p2).area 
-                
-                # 2. Mẫu số thành phần 1: intersection(V_box, V_ref)
-                # (Phần bản đồ lọt vào trong khung hình camera)
-                inter_box_ref = v_box.intersection(p2).area
-                
-                # 3. Mẫu số thành phần 2: intersection(V_box, V_cam)
-                # (Phần camera lọt vào khung hình - thường là chính nó vì box bao quanh nó)
-                inter_box_cam = v_box.intersection(p1_rot).area
-                
-                # Tính toán Eq. 4
-                denominator = math.sqrt(inter_box_ref * inter_box_cam + 1e-9)
-                
-                if denominator > 0:
-                    alpha = inter_cam_ref / denominator
-                    if alpha > best_alpha: best_alpha = alpha 
-            except: 
-                pass 
-                
-            if best_alpha > 0.95: break 
-            
-        return best_alpha 
+        # V_cam và V_box phải dịch chuyển cùng nhau
+        p_cam_centered = translate(cam_poly, -c_cam.x, -c_cam.y)
+        p_box_centered = translate(v_box, -c_cam.x, -c_cam.y)
+        p_ref_centered = translate(ref_poly, -c_ref.x, -c_ref.y)
 
-    def process(self, drone_poly, estimated_pos, search_radius=300): 
-        # ... (Phần logic giữ nguyên như cũ) ...
-        if drone_poly is None: return [] 
-        candidates = [] 
+        best_alpha = 0.0
+        best_angle = 0.0
         
-        drone_vecs = []
-        cx, cy = drone_poly.centroid.x, drone_poly.centroid.y
-        poly_centered = translate(drone_poly, -cx, -cy)
-        for ang in [0, 90, 180, 270]:
-            p_rot = rotate(poly_centered, ang, origin=(0,0))
-            p_back = translate(p_rot, cx, cy) 
-            drone_vecs.append(self.compute_shape_vector(p_back))
+        # Pre-compute mẫu số phần Cam (Term 2)
+        # Term 2: intersection(V_box, V_cam) -> Chính là diện tích V_cam
+        term2_denom = p_box_centered.intersection(p_cam_centered).area
 
-        for item in self.map_data: 
-            if estimated_pos is not None: 
-                if np.linalg.norm(np.array(item['centroid']) - estimated_pos) > search_radius: continue 
+        # 3. Quét góc xoay (Fine Matching)
+        # Quét 360 độ nếu chưa biết hướng.
+        for ang in np.arange(-180, 180, 5): 
             
-            area_ratio = drone_poly.area / (item['area'] + 1e-5)
-            # Nới lỏng ratio một chút vì Eq 4 xử lý tốt việc diện tích không khớp do bị cắt
-            if area_ratio < 0.3 or area_ratio > 3.0: continue 
-
-            min_shape_dist = 100.0
-            for d_vec in drone_vecs:
-                d = self.coarse_distance(d_vec, item['vector'])
-                if d < min_shape_dist: min_shape_dist = d
+            # Xoay V_cam và V_box (V_ref giữ nguyên)
+            r_cam = rotate(p_cam_centered, ang, origin=(0,0))
+            r_box = rotate(p_box_centered, ang, origin=(0,0))
             
-            if min_shape_dist < 0.8: 
-                candidates.append(item) 
-
-        gmm_components = [] 
-        cam_center = np.array([200, 200]) 
-        vec_center_to_bld = np.array([drone_poly.centroid.x, drone_poly.centroid.y]) - cam_center
+            # --- TỬ SỐ (NUMERATOR) ---
+            # intersection(V_cam, V_ref)
+            inter_cam_ref = r_cam.intersection(p_ref_centered).area
+            
+            if inter_cam_ref > 0:
+                # --- MẪU SỐ (DENOMINATOR) - EQ. 4 ---
+                
+                # Term 1: intersection(V_box, V_ref)
+                # Phần Reference lọt vào trong khung Box đang xoay
+                term1_denom = r_box.intersection(p_ref_centered).area
+                
+                # Mẫu số = sqrt( Term1 * Term2 )
+                denom = math.sqrt(term1_denom * term2_denom)
+                
+                if denom > 0:
+                    alpha = inter_cam_ref / denom
+                    
+                    if alpha > best_alpha:
+                        best_alpha = alpha
+                        best_angle = ang
         
-        for cand in candidates: 
-            # Gọi hàm compute_correlation MỚI (Eq 4)
-            alpha = self.compute_correlation(drone_poly, cand['poly']) 
+        return best_alpha, best_angle
+
+    def process(self, cam_poly, cam_center, est_pos, search_radius=500):
+        if cam_poly is None: return []
+
+        # Simplify để tăng tốc độ tính toán
+        cam_poly = cam_poly.simplify(0.5, preserve_topology=True)
+        cam_vec = self.compute_shape_vector(cam_poly)
+        if np.sum(cam_vec) == 0: return []
+
+        results = []
+        rel_vec_x = cam_poly.centroid.x - cam_center[0]
+        rel_vec_y = cam_poly.centroid.y - cam_center[1]
+
+        for item in self.map_data:
+            # Lọc theo khoảng cách
+            if est_pos is not None:
+                dist = np.linalg.norm(np.array(item['centroid']) - est_pos)
+                if dist > search_radius:
+                    continue
+
+            # Lọc thô bằng Shape Context
+            if self.coarse_distance(cam_vec, item['vector']) > 0.35: 
+                continue
+
+            # So khớp tinh bằng Eq. 4 (Strict)
+            alpha, angle = self.compute_correlation(cam_poly, item['poly'])
             
-            if alpha > 0.6: 
-                map_centroid = np.array(cand['centroid']) 
-                measured_pos = map_centroid - vec_center_to_bld 
-                gmm_components.append({ 
-                    'mu': measured_pos, 
-                    'cov': np.eye(2) * 50.0, 
-                    'alpha': alpha 
-                }) 
-        return gmm_components 
+            # Ngưỡng chấp nhận (Threshold eta)
+            if alpha > 0.65:
+                pt_rel = Point(rel_vec_x, rel_vec_y)
+                pt_rotated = rotate(pt_rel, angle, origin=(0,0))
+                
+                # Vị trí tuyệt đối = Vị trí Ref - Vector tương đối (đã xoay)
+                mu_x = item['centroid'][0] - pt_rotated.x
+                mu_y = item['centroid'][1] - pt_rotated.y
+                mu = np.array([mu_x, mu_y])
+                
+                # Hiệp phương sai cố định (hoặc phụ thuộc alpha nếu muốn)
+                cov = np.array([[100.0, 0], [0, 100.0]])
+                
+                results.append({'mu': mu, 'cov': cov, 'alpha': alpha})
+                
+        return results
 
 # ============================================================================== 
 # 4. MAIN PROGRAM
