@@ -469,9 +469,9 @@ def main():
         # --- VISUALIZATION (GIỮ NGUYÊN GIAO DIỆN) ---
         vis = vis_map.copy()
         
-        # Vẽ Particles (Màu xanh lá)
+        # Vẽ Particles (Màu cam)
         for p in pf.particles: 
-            cv2.circle(vis, (int(p[0]), int(p[1])), 2, (0, 255, 0), -1) 
+            cv2.circle(vis, (int(p[0]), int(p[1])), 2, (255, 165, 0), -1) 
         
         # Vẽ Vị trí ước lượng (Màu đỏ)
         # Nếu S_t < 0 (Không tin cậy) -> Vẽ màu vàng
